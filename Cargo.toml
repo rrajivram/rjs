@@ -1,0 +1,6 @@
+[workspace]
+members=["macros", "rjs_core", "vm"]
+resolver="3"
+
+[profile.release]
+debug = true
