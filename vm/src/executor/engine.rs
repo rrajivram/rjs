@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Display, sync::Arc};
 
 use rjs_core::{
-    expr::{AssignOp, Expr},
+    expr::{AssignOp, BinaryOp, Expr},
     literal::Literal,
     pattern::Pattern,
     run_parser,
@@ -12,9 +12,9 @@ use crate::{
     error::JSError,
     executor::{
         instr::{Binary, Instruction, Set, Value},
-        scope::Scope,
+        scope::{Scope, VariableType},
     },
-    primitive::ArcPrimitive,
+    primitive::{ArcPrimitive, jstack::JSStack},
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +35,7 @@ pub enum Register {
 pub struct JSEngine {
     pub scope: Arc<Scope>,
     pub registers: HashMap<Register, Option<ArcPrimitive>>,
+    pub stack: JSStack,
 }
 
 #[allow(clippy::new_without_default)]
@@ -49,6 +50,7 @@ impl JSEngine {
         Self {
             scope: Arc::new(Scope::default()),
             registers,
+            stack: JSStack::default(),
         }
     }
 
@@ -119,6 +121,9 @@ impl JSEngine {
                                 r_value: Some(v),
                             }));
                         } else if let InstructionType::Instruction(ins) = ins {
+                            // Assigning from a register only updates an
+                            // existing variable, so declare it first.
+                            scope.add_variable(&id.value, VariableType::Any, None)?;
                             instrs.extend(ins);
                             instrs.push(Instruction::Set(Set {
                                 l_value: super::instr::Value::Var(id.value.clone()),
@@ -155,51 +160,41 @@ impl JSEngine {
             Expr::Unary { op, value } => todo!(),
             Expr::Update { op, prefix, target } => todo!(),
             Expr::Binary { left, op, right } => {
-                let right = self.emit_exprs(scope, right, Some(Register::BX))?;
-                let left = self.emit_exprs(scope, left, Some(Register::AX))?;
-                match (left, right) {
-                    (InstructionType::Value(v1), InstructionType::Value(v2)) => {
-                        let ins = Instruction::Binary(Binary {
-                            left: v1,
-                            right: v2,
-                            op: *op,
-                            output,
-                        });
-                        Ok(InstructionType::Instruction(vec![ins]))
+                let left = self.emit_exprs(scope, left, None)?;
+                let right = self.emit_exprs(scope, right, None)?;
+                let mut ins = vec![];
+                // An instruction list leaves its result in AX.
+                let mut left = match left {
+                    InstructionType::Value(v) => v,
+                    InstructionType::Instruction(l) => {
+                        ins.extend(l);
+                        Value::Register(Register::AX)
                     }
-                    (InstructionType::Value(v), InstructionType::Instruction(rins)) => {
-                        let mut ins = rins;
-                        ins.push(Instruction::Binary(Binary {
-                            left: v,
-                            op: *op,
-                            right: Value::Register(Register::BX),
-                            output: Some(Register::BX),
-                        }));
-                        Ok(InstructionType::Instruction(ins))
-                    }
-                    (InstructionType::Instruction(lins), InstructionType::Value(v)) => {
-                        let mut ins = lins;
-                        ins.push(Instruction::Binary(Binary {
-                            left: Value::Register(Register::AX),
-                            op: *op,
-                            right: v,
-                            output: Some(Register::AX),
-                        }));
-                        Ok(InstructionType::Instruction(ins))
-                    }
-                    (InstructionType::Instruction(l), InstructionType::Instruction(r)) => {
-                        let mut ins = l;
+                };
+                let right = match right {
+                    InstructionType::Value(v) => v,
+                    InstructionType::Instruction(r) => {
+                        // The right side's instructions reuse AX, so move the
+                        // left result out of the way first.
+                        if let Value::Register(reg) = left {
+                            let tmp = scope.new_temp_var();
+                            ins.push(Instruction::Set(Set {
+                                l_value: Value::Var(tmp.clone()),
+                                r_value: Some(Value::Register(reg)),
+                            }));
+                            left = Value::Var(tmp);
+                        }
                         ins.extend(r);
-                        ins.push(Instruction::Binary(Binary {
-                            left: Value::Register(Register::AX),
-                            op: *op,
-                            right: Value::Register(Register::BX),
-                            output: None,
-                        })); // default to AX
-                        Ok(InstructionType::Instruction(ins))
+                        Value::Register(Register::AX)
                     }
-                }
-                //if let InstructionType::
+                };
+                ins.push(Instruction::Binary(Binary {
+                    left,
+                    op: *op,
+                    right,
+                    output,
+                }));
+                Ok(InstructionType::Instruction(ins))
             }
             Expr::Conditional {
                 test,
@@ -208,24 +203,29 @@ impl JSEngine {
             } => todo!(),
             Expr::Assign { target, op, value } => {
                 let ident = self.emit_exprs(scope, target, None)?;
-                assert!(matches!(op, AssignOp::Assign));
                 if let InstructionType::Value(Value::Var(v)) = ident {
-                    let ins = self.emit_exprs(scope, value, None)?;
-                    match ins {
-                        InstructionType::Value(rv) => {
-                            Ok(InstructionType::Instruction(vec![Instruction::Set(Set {
-                                l_value: Value::Var(v),
-                                r_value: Some(rv),
-                            })]))
-                        }
-                        InstructionType::Instruction(mut ins) => {
-                            ins.push(Instruction::Set(Set {
-                                l_value: Value::Var(v),
-                                r_value: Some(Value::Register(Register::AX)),
+                    let (mut ins, rv) = match self.emit_exprs(scope, value, None)? {
+                        InstructionType::Value(rv) => (vec![], rv),
+                        InstructionType::Instruction(ins) => (ins, Value::Register(Register::AX)),
+                    };
+                    // `x op= y` is `x = x op y`.
+                    let rv = match compound_op(*op) {
+                        None => rv,
+                        Some(bin) => {
+                            ins.push(Instruction::Binary(Binary {
+                                left: Value::Var(v.clone()),
+                                op: bin,
+                                right: rv,
+                                output: Some(Register::AX),
                             }));
-                            Ok(InstructionType::Instruction(ins))
+                            Value::Register(Register::AX)
                         }
-                    }
+                    };
+                    ins.push(Instruction::Set(Set {
+                        l_value: Value::Var(v),
+                        r_value: Some(rv),
+                    }));
+                    Ok(InstructionType::Instruction(ins))
                 } else {
                     todo!()
                 }
@@ -276,6 +276,34 @@ impl JSEngine {
     }
 }
 
+/// The binary operator a compound assignment applies, or `None` for plain
+/// `=`.
+///
+/// `&&=`, `||=` and `??=` are emitted as `x = x && y` etc. That's the same
+/// result, except that JS skips evaluating `y` and the assignment entirely
+/// when `x` already decides the outcome (observable via side effects in `y`,
+/// or `const x`).
+fn compound_op(op: AssignOp) -> Option<BinaryOp> {
+    Some(match op {
+        AssignOp::Assign => return None,
+        AssignOp::Add => BinaryOp::Add,
+        AssignOp::Sub => BinaryOp::Sub,
+        AssignOp::Mul => BinaryOp::Mul,
+        AssignOp::Div => BinaryOp::Div,
+        AssignOp::Mod => BinaryOp::Mod,
+        AssignOp::Exp => BinaryOp::Exp,
+        AssignOp::Shl => BinaryOp::Shl,
+        AssignOp::Shr => BinaryOp::Shr,
+        AssignOp::UShr => BinaryOp::UShr,
+        AssignOp::BitAnd => BinaryOp::BitAnd,
+        AssignOp::BitOr => BinaryOp::BitOr,
+        AssignOp::BitXor => BinaryOp::BitXor,
+        AssignOp::And => BinaryOp::And,
+        AssignOp::Or => BinaryOp::Or,
+        AssignOp::Nullish => BinaryOp::Nullish,
+    })
+}
+
 impl std::fmt::Display for JSEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "registers: {:?}", self.registers)?;
@@ -308,6 +336,96 @@ mod tests {
         engine.exec(SOURCE).unwrap();
         assert!(engine.scope.get_variable("a") == Some(ArcPrimitive::from(1.0)));
         assert!(engine.scope.get_variable("b") == Some(ArcPrimitive::from(13.0)));
+    }
+
+    /// Run `src` and return the value of variable `name` afterwards.
+    fn run(src: &str, name: &str) -> ArcPrimitive {
+        let mut engine = JSEngine::new();
+        engine.exec(src).unwrap();
+        engine
+            .scope
+            .get_variable(name)
+            .unwrap_or_else(|| panic!("`{name}` has no value after: {src}"))
+    }
+
+    #[test]
+    fn test_assign_ops() {
+        for (src, expected) in [
+            ("let x = 10; x = 3", ArcPrimitive::from(3.0)),
+            ("let x = 10; x += 3", 13.0.into()),
+            ("let x = 'a'; x += 'b'", "ab".into()),
+            ("let x = 10; x -= 3", 7.0.into()),
+            ("let x = 10; x *= 3", 30.0.into()),
+            ("let x = 10; x /= 4", 2.5.into()),
+            ("let x = 10; x %= 4", 2.0.into()),
+            ("let x = 2; x **= 10", 1024.0.into()),
+            ("let x = 3; x <<= 2", 12.0.into()),
+            ("let x = 0 - 12; x >>= 2", (-3.0).into()),
+            ("let x = 0 - 1; x >>>= 28", 15.0.into()),
+            ("let x = 12; x &= 10", 8.0.into()),
+            ("let x = 12; x |= 3", 15.0.into()),
+            ("let x = 12; x ^= 10", 6.0.into()),
+            ("let x = 1; x &&= 'set'", "set".into()),
+            ("let x = 0; x &&= 'set'", 0.0.into()),
+            ("let x = 0; x ||= 'set'", "set".into()),
+            ("let x = 1; x ||= 'set'", 1.0.into()),
+            ("let x = null; x ??= 'set'", "set".into()),
+            ("let x = 0; x ??= 'set'", 0.0.into()),
+        ] {
+            assert_eq!(run(src, "x"), expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn test_assign_ops_with_expressions() {
+        assert_eq!(run("let x = 1; let y = 2; x += y * 3", "x"), 7.0.into());
+        assert_eq!(
+            run("let x = 100; let y = 2; x -= y ** 3 + 2", "x"),
+            90.0.into()
+        );
+        assert_eq!(
+            run("let x = 1; let y = 2; x += y; x *= y; x -= 1", "x"),
+            5.0.into()
+        );
+        assert_eq!(run("let x = 5; x = x * x - 1", "x"), 24.0.into());
+    }
+
+    #[test]
+    fn test_binary_ops_in_expressions() {
+        for (src, expected) in [
+            ("let r = 10 - 2 * 3", ArcPrimitive::from(4.0)),
+            ("let r = 10 - 2 - 3", 5.0.into()),
+            ("let r = 2 ** 3 ** 2", 512.0.into()),
+            (
+                "let a = 1; let c = 2; let d = 3; let r = a - c * d * d",
+                (-17.0).into(),
+            ),
+            ("let a = 2; let b = 3; let r = a * b + b * a", 12.0.into()),
+            ("let a = 7; let r = a % 4 + a / 2", 6.5.into()),
+            ("let r = 1 + 2 < 4", true.into()),
+            ("let r = 1 < 2 == 2 > 1", true.into()),
+            ("let r = '1' == 1", true.into()),
+            ("let r = '1' === 1", false.into()),
+            ("let r = 1 != 2", true.into()),
+            ("let r = 1 !== 1", false.into()),
+            ("let r = 5 & 3 | 8", 9.0.into()),
+            ("let r = 1 << 4 >> 2", 4.0.into()),
+            ("let r = 0 || 2 && 3", 3.0.into()),
+            ("let r = null ?? 'fallback'", "fallback".into()),
+            ("let r = 3 >= 3", true.into()),
+            ("let r = 2 <= 1", false.into()),
+        ] {
+            assert_eq!(run(src, "r"), expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn test_binary_op_errors_propagate() {
+        let mut engine = JSEngine::new();
+        assert!(matches!(
+            engine.exec("let r = 'a' in 1"),
+            Err(JSError::TypeError(_))
+        ));
     }
 
     #[test]

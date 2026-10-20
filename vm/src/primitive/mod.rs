@@ -5,9 +5,11 @@ use rjs_core::literal::{Literal, NumberLiteral, NumberValue};
 use crate::primitive::objects::Object;
 
 pub mod builtin;
+pub mod jstack;
 pub mod non_numeric;
 pub mod numeric;
 pub mod objects;
+pub mod ops;
 
 #[derive(Debug, Clone)]
 pub enum Primitive {
