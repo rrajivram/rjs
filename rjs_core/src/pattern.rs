@@ -13,24 +13,49 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// A binding target: where a value goes when it's bound to a variable, in
+/// declarations (`let <pattern> = ...`), function parameters, `catch (...)`
+/// and `for (const <pattern> of ...)`.
+///
+/// Usually just a name, but it can also be a *destructuring* pattern that
+/// pulls a value apart into several variables at once:
+///
+/// ```js
+/// const { name, age } = user;    // Object: two variables from properties
+/// const [first, ...others] = xs; // Array: from elements, rest into `others`
+/// function f({ id = 0 }) {}      // works in parameters too, with defaults
+/// ```
 pub enum Pattern {
+    /// A single variable: the `x` in `let x = 1`.
     Ident(Ident),
-    /// `[a, , b]` — `None` is a hole.
+    /// Array destructuring, binding by position:
+    /// `const [a, b] = [1, 2]` sets `a = 1`, `b = 2`.
+    ///
+    /// `None` is a hole that skips an element: `const [, second] = xs`.
     Array(Vec<Option<Pattern>>),
+    /// Object destructuring, binding by property name:
+    /// `const { x, y: renamed } = point` sets `x = point.x` and
+    /// `renamed = point.y`. See [`PatternProp`].
     Object(Vec<PatternProp>),
-    /// `target = default`
+    /// `target = default`: uses `default` when the value is `undefined`,
+    /// e.g. the `b = 2` in `function f(a, b = 2)` or `const [x = 0] = xs`.
     Default(Box<Pattern>, Box<Expr>),
-    /// `...target`
+    /// `...target`: collects the remaining elements into an array, as the
+    /// last array-pattern element or last parameter: `function f(...args)`.
     Rest(Box<Pattern>),
 }
 
 #[derive(Debug, Clone)]
+/// One entry of an object destructuring pattern `{ ... }`.
 pub enum PatternProp {
-    /// `key: pattern`
+    /// `key: pattern`: binds property `key` to a differently named variable
+    /// or a nested pattern: `{ id: userId }`, `{ pos: { x, y } }`.
     KeyValue(PropKey, Pattern),
-    /// `name` or `name = default`
+    /// `name`: binds property `name` to a variable of the same name.
+    /// `name = default` also supplies a fallback: `{ port = 80 }`.
     Shorthand(Ident, Option<Expr>),
-    /// `...rest`
+    /// `...rest`: collects the remaining properties into a new object:
+    /// `const { id, ...fields } = record`.
     Rest(Pattern),
 }
 

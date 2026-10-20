@@ -20,71 +20,114 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// Any JavaScript statement: code that does something, rather than producing
+/// a value. A program is a list of these.
 pub enum Statement {
+    /// A lone `;` that does nothing: `for (;;);`, `if (x);`.
     Empty,
+    /// `{ ... }`: a list of statements with its own scope for `let`, `const`
+    /// and `class`.
     Block(Vec<Statement>),
+    /// An expression run for its side effects: `f();`, `x = 1;`, `i++;`.
     Expr(Expr),
+    /// A variable declaration: `let x = 1;`, `const [a, b] = pair;`,
+    /// `var i, j = 0;`. See [`VarDecl`].
     VarDecl(VarDecl),
+    /// A named function declaration: `function f(a) { ... }`. Unlike a
+    /// function expression, it is hoisted: callable before the line it's on.
     Function(Box<Function>),
+    /// A named class declaration: `class A extends B { ... }`.
     Class(Box<Class>),
+    /// `if (test) then` with an optional `else otherwise`. `else if` is just
+    /// an `If` nested in `otherwise`.
     If {
         test: Expr,
         then: Box<Statement>,
         otherwise: Option<Box<Statement>>,
     },
+    /// A C-style loop: `for (init; test; update) body`. Any of the three
+    /// header parts may be empty (`for (;;)` loops forever).
     For {
         init: Option<ForInit>,
         test: Option<Expr>,
         update: Option<Expr>,
         body: Box<Statement>,
     },
+    /// `for (left in right) body`: loops over the property *names* of an
+    /// object, e.g. `for (const key in obj)`.
     ForIn {
         left: ForLeft,
         right: Expr,
         body: Box<Statement>,
     },
+    /// `for (left of right) body`: loops over the *values* of an iterable
+    /// (array, string, Map, ...), e.g. `for (const x of list)`.
+    /// `is_await` is true for `for await (... of ...)`, which iterates an
+    /// async iterable, awaiting each value.
     ForOf {
         is_await: bool,
         left: ForLeft,
         right: Expr,
         body: Box<Statement>,
     },
+    /// `while (test) body`: checks `test` before each iteration.
     While {
         test: Expr,
         body: Box<Statement>,
     },
+    /// `do body while (test)`: runs `body` once, then checks `test` after
+    /// each iteration.
     DoWhile {
         body: Box<Statement>,
         test: Expr,
     },
+    /// `return value;`, or bare `return;` (`value` is `None`) which returns
+    /// `undefined`.
     Return {
         span: TokenSpan,
         value: Option<Expr>,
     },
+    /// `break;` exits the innermost loop or `switch`. `break outer;` exits
+    /// the statement labeled `outer:` instead.
     Break {
         span: TokenSpan,
         label: Option<Ident>,
     },
+    /// `continue;` skips to the next iteration of the innermost loop.
+    /// `continue outer;` does so for the loop labeled `outer:`.
     Continue {
         span: TokenSpan,
         label: Option<Ident>,
     },
+    /// `throw value;`: raises an exception.
     Throw(Expr),
+    /// `try { block } catch (e) { ... } finally { ... }`. At least one of
+    /// `handler` (the `catch`) and `finalizer` (the `finally` block) is
+    /// present.
     Try {
         block: Vec<Statement>,
         handler: Option<Catch>,
         finalizer: Option<Vec<Statement>>,
     },
+    /// `switch (discriminant) { case ...: ... default: ... }`. See
+    /// [`SwitchCase`].
     Switch {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
     },
+    /// A statement with a name for `break`/`continue` to target:
+    /// `outer: for (...) { for (...) { break outer; } }`.
     Labeled {
         label: Ident,
         body: Box<Statement>,
     },
+    /// `debugger;`: pauses execution when a debugger is attached.
     Debugger,
+    /// An ES module import: `import x, { a as b } from 'm';`. See
+    /// [`ImportDecl`].
     Import(ImportDecl),
+    /// An ES module export: `export const x = 1;`, `export default f;`,
+    /// `export { a };`. See [`ExportDecl`].
     Export {
         span: TokenSpan,
         decl: ExportDecl,
@@ -92,38 +135,65 @@ pub enum Statement {
 }
 
 #[derive(Debug, Clone, JSParser)]
+/// The keyword that starts a variable declaration. Each variant keeps the
+/// keyword token, for its source position.
 pub enum DeclKind {
+    /// `let`: block-scoped, can be reassigned.
     Let(LET),
+    /// `const`: block-scoped, must be initialized, cannot be reassigned.
     Const(CONST),
+    /// `var`: function-scoped (visible throughout the enclosing function,
+    /// even before its line) and can be redeclared. Legacy; prefer `let`.
     Var(VAR),
 }
 
 #[derive(Debug, Clone)]
+/// `let`/`const`/`var` followed by one or more comma-separated declarators:
+/// `let a = 1, b, [c, d] = pair;` has three.
 pub struct VarDecl {
     pub kind: DeclKind,
     pub decls: Vec<Declarator>,
 }
 
 #[derive(Debug, Clone)]
+/// One `target = init` in a declaration.
+///
+/// `target` is usually a plain name (`Pattern::Ident`), but can be a
+/// destructuring pattern that unpacks the value into several variables:
+/// `const { x, y } = point;` declares `x` and `y` from the object's
+/// properties, and `const [first, second] = list;` declares `first` and
+/// `second` from the array's elements. See [`Pattern`].
+///
+/// `init` is `None` for `let x;` (the variable starts as `undefined`).
 pub struct Declarator {
     pub target: Pattern,
     pub init: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
+/// The first part of a C-style `for (init; test; update)` header.
 pub enum ForInit {
+    /// Declares the loop variable(s): `for (let i = 0; ...)`.
     VarDecl(VarDecl),
+    /// Assigns existing variables: `for (i = 0, j = n; ...)`.
     Expr(Expr),
 }
 
 /// The binding of a `for-in`/`for-of` loop.
 #[derive(Debug, Clone)]
+/// What each value is bound to in `for (left in ...)` / `for (left of ...)`.
 pub enum ForLeft {
+    /// A fresh variable per iteration: `for (const x of xs)`, or with
+    /// destructuring, `for (const [key, value] of map)`.
     Decl(DeclKind, Pattern),
+    /// An existing variable or property: `for (x of xs)`, `for (obj.k in o)`.
     Expr(Expr),
 }
 
 #[derive(Debug, Clone)]
+/// The `catch` clause of a `try`. `param` is the variable bound to the
+/// thrown value: `catch (e)`, `catch ({ message })`, or `None` for a bare
+/// `catch { ... }` that ignores it.
 pub struct Catch {
     pub param: Option<Pattern>,
     pub body: Vec<Statement>,
@@ -131,6 +201,9 @@ pub struct Catch {
 
 /// `case test:` or, when `test` is `None`, `default:`.
 #[derive(Debug, Clone)]
+/// One clause of a `switch`: `case test: body`, or `default: body` when
+/// `test` is `None`. Without a `break`, execution falls through into the next
+/// clause's body, so a clause's `body` may be empty (`case 1: case 2: ...`).
 pub struct SwitchCase {
     /// The `case`/`default` keyword.
     pub span: TokenSpan,
@@ -139,33 +212,47 @@ pub struct SwitchCase {
 }
 
 #[derive(Debug, Clone)]
+/// `import ... from 'source'`. Any combination of the binding forms may be
+/// empty; all empty is a side-effect import, `import 'polyfill';`.
 pub struct ImportDecl {
     /// The `import` keyword.
     pub span: TokenSpan,
+    /// `import React from 'react'`: the module's default export.
     pub default: Option<Ident>,
+    /// `import * as path from 'path'`: the whole module as one object.
     pub namespace: Option<Ident>,
+    /// `import { a, b as c } from 'm'`: specific named exports.
     pub named: Vec<ModuleSpec>,
+    /// The module path, e.g. `'react'` or `'./util.js'`.
     pub source: String,
 }
 
 /// `name` or `name as alias` in an import/export list.
 #[derive(Debug, Clone)]
+/// One name in an `import { ... }` / `export { ... }` list: `a`, or
+/// `a as b` to use a different local (import) or public (export) name.
 pub struct ModuleSpec {
     pub name: Ident,
     pub alias: Option<Ident>,
 }
 
 #[derive(Debug, Clone)]
+/// What an `export` statement exports.
 pub enum ExportDecl {
-    /// `export const/function/class ...`
+    /// A declaration, exported under its own name:
+    /// `export const x = 1`, `export function f() {}`, `export class A {}`.
     Decl(Box<Statement>),
+    /// The module's single default export: `export default value`, which is
+    /// what `import x from 'm'` receives.
     Default(Expr),
-    /// `export { a, b as c } (from 'm')?`
+    /// Existing bindings by name: `export { a, b as c }`. With `source`,
+    /// re-exports another module's names: `export { a } from './m'`.
     Named {
         specs: Vec<ModuleSpec>,
         source: Option<String>,
     },
-    /// `export * (as ns)? from 'm'`
+    /// Re-exports everything from another module: `export * from './m'`,
+    /// or as one namespace object with `alias`: `export * as ns from './m'`.
     All {
         alias: Option<Ident>,
         source: String,

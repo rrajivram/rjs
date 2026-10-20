@@ -10,7 +10,7 @@
 //! NOTE: some keyword structs shadow prelude names (`String`, `Option`,
 //! `Some`-adjacent ones like `All`) inside this module — generated code and
 //! anything added here must use fully-qualified `::std` / `::core` paths.
-
+#![allow(clippy::upper_case_acronyms, clippy::self_named_constructors)]
 macro_rules! define_keywords {
     ($($k:ident = $s:literal),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

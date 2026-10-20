@@ -22,18 +22,28 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// A `function`: declarations (`function f() {}`), function expressions
+/// (`const f = function () {}`) and the body of methods.
 pub struct Function {
+    /// `None` for anonymous function expressions and methods (a method's
+    /// name is its [`Method::key`]).
     pub name: Option<Ident>,
+    /// `async function`: returns a promise and may use `await`.
     pub is_async: bool,
+    /// `function*`: a generator, which may use `yield`.
     pub generator: bool,
     pub params: Vec<Pattern>,
     pub body: Vec<Statement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What kind of member a [`Method`] defines.
 pub enum MethodKind {
+    /// A plain method: `{ area() { ... } }`, called as `obj.area()`.
     Method,
+    /// A getter: `{ get area() { ... } }`, run when reading `obj.area`.
     Get,
+    /// A setter: `{ set area(v) { ... } }`, run when assigning `obj.area = v`.
     Set,
 }
 
@@ -47,6 +57,9 @@ pub struct Method {
 }
 
 #[derive(Debug, Clone)]
+/// An arrow function: `x => x + 1`, `async (a, b) => { ... }`. Unlike a
+/// `function`, it has no `this`, `arguments` or `super` of its own (it uses
+/// the enclosing function's) and cannot be called with `new`.
 pub struct Arrow {
     pub is_async: bool,
     pub params: Vec<Pattern>,
@@ -54,12 +67,19 @@ pub struct Arrow {
 }
 
 #[derive(Debug, Clone)]
+/// The part of an arrow function after `=>`.
 pub enum ArrowBody {
+    /// A single expression whose value is returned: `x => x * 2`.
     Expr(Box<Expr>),
+    /// A `{ ... }` block that needs an explicit `return`:
+    /// `x => { return x * 2 }`.
     Block(Vec<Statement>),
 }
 
 #[derive(Debug, Clone)]
+/// A class: `class Name extends Base { members }`, as a declaration or an
+/// expression. `name` is `None` only for anonymous class expressions;
+/// `extends` is the parent class.
 pub struct Class {
     pub name: Option<Ident>,
     pub extends: Option<Expr>,
@@ -67,11 +87,18 @@ pub struct Class {
 }
 
 #[derive(Debug, Clone)]
+/// One member of a class body. `is_static` members belong to the class
+/// itself (`A.create()`) rather than to each instance (`new A().m()`).
 pub enum ClassMember {
+    /// A method, getter or setter. A method named `constructor` is the
+    /// class constructor: `class A { constructor(x) { this.x = x } }`.
     Method {
         is_static: bool,
         method: Method,
     },
+    /// A field: `count = 0;` sets a property on each new instance, or on the
+    /// class itself when static. `value` is `None` for `count;`
+    /// (initialized to `undefined`).
     Field {
         is_static: bool,
         key: PropKey,

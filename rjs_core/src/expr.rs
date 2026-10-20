@@ -20,65 +20,117 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+/// Any JavaScript expression: code that produces a value.
 pub enum Expr {
+    /// A constant written directly in the source: `42`, `'hi'`, `true`,
+    /// `null`.
     Literal(Literal),
+    /// A variable reference by name: `x`, `console`, `$el`.
     Ident(Ident),
+    /// The `this` keyword: the object the current function was called on.
     This(TokenSpan),
+    /// The `super` keyword. Only valid as `super(...)` (calling the parent
+    /// class constructor) or `super.x` / `super[x]` (a parent-class member);
+    /// the parser accepts it anywhere and the validator rejects misuse.
     Super(TokenSpan),
-    /// `[a, , ...b]` — `None` is a hole.
+    /// An array literal: `[1, 2, 3]`.
+    ///
+    /// Each slot is `None` for a hole, an empty slot between commas:
+    /// `[1, , 3]` is `[Some(1), None, Some(3)]`. Spread elements appear as
+    /// `Expr::Spread`: `[...a, b]`.
     Array(Vec<Option<Expr>>),
+    /// An object literal: `{ a: 1, b, [k]: 2, m() {}, ...rest }`. See
+    /// [`Property`] for each entry form.
     Object(Vec<Property>),
+    /// A function expression, where a function is used as a value:
+    /// `const f = function () {}`, `arr.map(function (x) { ... })`.
+    /// Its name is optional, unlike a `function` declaration statement.
     Function(Box<Function>),
+    /// An arrow function: `x => x * 2`, `(a, b) => { return a + b }`.
     Arrow(Box<Arrow>),
+    /// A class expression, where a class is used as a value:
+    /// `const A = class extends B {}`.
     Class(Box<Class>),
+    /// An expression wrapped in parentheses: `(a + b)`. Kept in the AST,
+    /// rather than discarded, so the printer and validator can tell `(a)`
+    /// from `a` (e.g. `(-2) ** 2` is valid but `-2 ** 2` is not).
     Paren(Box<Expr>),
-    /// `...value` in array literals and call arguments.
+    /// `...value`: spreads an iterable into an array literal (`[...a]`) or
+    /// into call arguments (`f(...args)`). Only valid in those two places.
     Spread(Box<Expr>),
+    /// A prefix operator applied to one operand: `-x`, `!ok`, `typeof v`,
+    /// `await p`. See [`UnaryOp`].
     Unary {
         op: UnaryOp,
         value: Box<Expr>,
     },
+    /// Increment or decrement of a variable or property: `i++`, `--count`.
+    /// `prefix` is true for `++i` (evaluates to the new value) and false for
+    /// `i++` (evaluates to the old value).
     Update {
         op: UpdateOp,
         prefix: bool,
         target: Box<Expr>,
     },
+    /// An operator between two operands: `a + b`, `x < 10`, `a && b`,
+    /// `k in obj`. Precedence is already resolved by the parser's nesting:
+    /// `1 + 2 * 3` is `Binary(1, +, Binary(2, *, 3))`. See [`BinaryOp`].
     Binary {
         left: Box<Expr>,
         op: BinaryOp,
         right: Box<Expr>,
     },
+    /// The ternary operator: `test ? then : otherwise`.
     Conditional {
         test: Box<Expr>,
         then: Box<Expr>,
         otherwise: Box<Expr>,
     },
+    /// An assignment: `x = 1`, `obj.count += 1`, `a ??= b`.
+    ///
+    /// For plain `=`, `target` may also be an array or object literal, which
+    /// then acts as a destructuring pattern: `[a, b] = [b, a]` swaps two
+    /// variables. Compound operators (`+=` etc.) need a variable or property
+    /// target. See [`AssignOp`].
     Assign {
         target: Box<Expr>,
         op: AssignOp,
         value: Box<Expr>,
     },
-    /// `a, b, c`
+    /// The comma operator: `a, b, c` evaluates each in turn and produces the
+    /// last. Mostly seen in `for (i = 0, j = n; ...; i++, j--)`.
     Sequence(Vec<Expr>),
+    /// Property access by a fixed name: `obj.name`, or `obj?.name` when
+    /// `optional` (yields `undefined` instead of throwing if `obj` is
+    /// `null`/`undefined`).
     Member {
         object: Box<Expr>,
         property: Ident,
         optional: bool,
     },
+    /// Property access by a computed key: `arr[i]`, `obj['a-b']`, or
+    /// `obj?.[key]` when `optional`.
     Index {
         object: Box<Expr>,
         index: Box<Expr>,
         optional: bool,
     },
+    /// A function call: `f(1, 2)`, `obj.method()`, or `f?.()` when
+    /// `optional` (skips the call if `f` is `null`/`undefined`).
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
         optional: bool,
     },
+    /// Constructing an object: `new Foo(1)`, or `new Foo` with no argument
+    /// list (`args` is then empty).
     New {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// Pausing a generator function: `yield value`, or bare `yield`
+    /// (`value` is `None`). `delegate` is true for `yield* other`, which
+    /// yields every value of another iterable in turn.
     Yield {
         span: TokenSpan,
         delegate: bool,
@@ -87,85 +139,156 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone)]
+/// One entry of an object literal `{ ... }`.
 pub enum Property {
+    /// `key: value`, e.g. `{ a: 1, 'b-c': 2, [k]: 3 }`.
     KeyValue(PropKey, Expr),
+    /// `{ name }`: short for `{ name: name }`, a property named after a
+    /// variable and holding its value.
     Shorthand(Ident),
+    /// A method or accessor: `{ m() {} }`, `{ get size() {} }`,
+    /// `{ set size(v) {} }`, `{ async *gen() {} }`.
     Method(Box<Method>),
+    /// `{ ...other }`: copies all of `other`'s own properties in.
     Spread(Expr),
 }
 
 #[derive(Debug, Clone)]
+/// The name of an object property, class member or destructured property.
 pub enum PropKey {
+    /// A bare name: the `a` in `{ a: 1 }`. Reserved words are allowed here
+    /// (`{ if: 1, class: 2 }`).
     Ident(Ident),
-    /// A string or number key.
+    /// A string or number key: `{ 'content-type': x, 0: y }`.
     Literal(Literal),
+    /// A key computed at runtime: `{ [prefix + 'Id']: 1 }`,
+    /// `{ [Symbol.iterator]() {} }`.
     Computed(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Prefix operators taking one operand.
 pub enum UnaryOp {
+    /// `+x`: converts to a number.
     Plus,
+    /// `-x`: numeric negation.
     Minus,
+    /// `!x`: logical not, converting to a boolean first.
     Not,
+    /// `~x`: bitwise not on the 32-bit integer value.
     BitNot,
+    /// `typeof x`: the type name as a string (`'number'`, `'object'`, ...).
     TypeOf,
+    /// `void x`: evaluates `x` and produces `undefined`.
     Void,
+    /// `delete obj.prop`: removes a property from an object.
     Delete,
+    /// `await promise`: waits for a promise inside an async function.
     Await,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// The operator of an [`Expr::Update`].
 pub enum UpdateOp {
+    /// `++`: add one.
     Increment,
+    /// `--`: subtract one.
     Decrement,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Operators between two operands, in an [`Expr::Binary`].
 pub enum BinaryOp {
+    /// `a + b`: numeric addition, or string concatenation if either side is
+    /// a string.
     Add,
+    /// `a - b`
     Sub,
+    /// `a * b`
     Mul,
+    /// `a / b`
     Div,
+    /// `a % b`: remainder.
     Mod,
+    /// `a ** b`: exponentiation (right-associative: `2 ** 3 ** 2` is
+    /// `2 ** 9`).
     Exp,
+    /// `a << b`: left shift.
     Shl,
+    /// `a >> b`: sign-preserving right shift.
     Shr,
+    /// `a >>> b`: zero-filling right shift.
     UShr,
+    /// `a < b`
     Lt,
+    /// `a > b`
     Gt,
+    /// `a <= b`
     LtEq,
+    /// `a >= b`
     GtEq,
+    /// `key in obj`: whether `obj` has a property named `key`.
     In,
+    /// `x instanceof C`: whether `x` was constructed by `C` (or a subclass).
     InstanceOf,
+    /// `a == b`: loose equality, converting types first (`1 == '1'`).
     Eq,
+    /// `a != b`: loose inequality.
     NotEq,
+    /// `a === b`: strict equality, no type conversion.
     StrictEq,
+    /// `a !== b`: strict inequality.
     StrictNotEq,
+    /// `a & b`: bitwise and.
     BitAnd,
+    /// `a | b`: bitwise or.
     BitOr,
+    /// `a ^ b`: bitwise xor.
     BitXor,
+    /// `a && b`: `b` if `a` is truthy, else `a` (short-circuits).
     And,
+    /// `a || b`: `a` if truthy, else `b` (short-circuits).
     Or,
+    /// `a ?? b`: `a` unless it is `null`/`undefined`, else `b`. Unlike `||`,
+    /// keeps falsy values like `0` and `''`.
     Nullish,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// The operator of an [`Expr::Assign`]. Every variant except `Assign` is a
+/// compound assignment: `x op= y` means `x = x op y`.
 pub enum AssignOp {
+    /// `x = y`
     Assign,
+    /// `x += y`
     Add,
+    /// `x -= y`
     Sub,
+    /// `x *= y`
     Mul,
+    /// `x /= y`
     Div,
+    /// `x %= y`
     Mod,
+    /// `x **= y`
     Exp,
+    /// `x <<= y`
     Shl,
+    /// `x >>= y`
     Shr,
+    /// `x >>>= y`
     UShr,
+    /// `x &= y`
     BitAnd,
+    /// `x |= y`
     BitOr,
+    /// `x ^= y`
     BitXor,
+    /// `x &&= y`: assigns only if `x` is truthy.
     And,
+    /// `x ||= y`: assigns only if `x` is falsy.
     Or,
+    /// `x ??= y`: assigns only if `x` is `null`/`undefined`.
     Nullish,
 }
 

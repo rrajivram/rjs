@@ -2,30 +2,39 @@
 
 use chumsky::{IterParser, Parser, error::Rich, extra, prelude::end};
 
-use crate::{lexer::tokenize, parser::JSCtx, span::TokenSpan, statement::Statement, token::TokenStruct};
+use crate::{
+    lexer::tokenize, parser::JSCtx, span::TokenSpan, statement::Statement, token::TokenStruct,
+};
 
 extern crate self as rjs_core;
 
-mod combo;
-mod expr;
-mod function;
-mod ident;
-mod keyword;
-mod lexer;
-mod literal;
-mod parser;
-mod pattern;
-mod span;
-mod statement;
-mod token;
-mod utils;
-mod validate;
+pub mod combo;
+pub mod expr;
+pub mod function;
+pub mod ident;
+pub mod keyword;
+pub mod lexer;
+pub mod literal;
+pub mod parser;
+pub mod pattern;
+pub mod span;
+pub mod statement;
+pub mod token;
+pub mod utils;
+pub mod validate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
     /// Byte range in the source text, when known.
     pub span: Option<TokenSpan>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ParseResult {
+    pub program: Vec<Statement>,
+    pub diagnostics: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 const SOURCE: &str = "
@@ -62,6 +71,39 @@ fn main() {
             Some(span) => println!("{}: error: {}", line_col(SOURCE, span.start), e.message),
             None => println!("error: {}", e.message),
         }),
+    }
+}
+
+pub fn run_parser(src: &str) -> ParseResult {
+    let mut program = vec![];
+    let mut diagnostics = vec![];
+    let mut errors = vec![];
+    match parse_js(src) {
+        Ok(prog) => {
+            //program.iter().for_each(|s| println!("{s}"));
+            program = prog;
+            diagnostics = validate::validate(&program)
+                .iter()
+                .map(|d| match d.span {
+                    Some(span) => format!("{}: {d}", line_col(SOURCE, span.start)),
+                    None => format!("{d}"),
+                })
+                .collect::<Vec<_>>();
+        }
+        Err(errs) => {
+            errors = errs
+                .iter()
+                .map(|e| match e.span {
+                    Some(span) => format!("{}: error: {}", line_col(SOURCE, span.start), e.message),
+                    None => format!("error: {}", e.message),
+                })
+                .collect::<Vec<_>>()
+        }
+    }
+    ParseResult {
+        program,
+        diagnostics,
+        errors,
     }
 }
 
