@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Display, sync::Arc};
+use std::{collections::HashMap, path::Display, rc::Rc};
 
 use rjs_core::{
     expr::{AssignOp, BinaryOp, Expr},
@@ -14,7 +14,7 @@ use crate::{
         instr::{Binary, Instruction, Set, Value},
         scope::{Scope, VariableType},
     },
-    primitive::{ArcPrimitive, jstack::JSStack},
+    primitive::{RcPrimitive, jstack::JSStack},
 };
 
 #[derive(Debug, Clone)]
@@ -33,8 +33,8 @@ pub enum Register {
 
 #[derive(Clone)]
 pub struct JSEngine {
-    pub scope: Arc<Scope>,
-    pub registers: HashMap<Register, Option<ArcPrimitive>>,
+    pub scope: Rc<Scope>,
+    pub registers: HashMap<Register, Option<RcPrimitive>>,
     pub stack: JSStack,
 }
 
@@ -48,7 +48,7 @@ impl JSEngine {
             (Register::DX, None),
         ]);
         Self {
-            scope: Arc::new(Scope::default()),
+            scope: Rc::new(Scope::default()),
             registers,
             stack: JSStack::default(),
         }
@@ -75,7 +75,7 @@ impl JSEngine {
 
     fn emit_code(
         &mut self,
-        scope: &Arc<Scope>,
+        scope: &Rc<Scope>,
         stmts: &[Statement],
     ) -> Result<Vec<Instruction>, JSError> {
         let mut instrs = vec![];
@@ -87,7 +87,7 @@ impl JSEngine {
 
     fn emit_statement(
         &mut self,
-        scope: &Arc<Scope>,
+        scope: &Rc<Scope>,
         st: &Statement,
     ) -> Result<Vec<Instruction>, JSError> {
         match st {
@@ -106,7 +106,7 @@ impl JSEngine {
 
     fn emit_vardecl(
         &mut self,
-        scope: &Arc<Scope>,
+        scope: &Rc<Scope>,
         decl: &VarDecl,
     ) -> Result<Vec<Instruction>, JSError> {
         let mut instrs = vec![];
@@ -140,7 +140,7 @@ impl JSEngine {
 
     fn emit_exprs(
         &mut self,
-        scope: &Arc<Scope>,
+        scope: &Rc<Scope>,
         ex: &Expr,
         output: Option<Register>,
     ) -> Result<InstructionType, JSError> {
@@ -255,9 +255,9 @@ impl JSEngine {
         }
     }
 
-    fn get_value_from_expr(&mut self, scope: &Arc<Scope>, ex: &Expr) -> Option<Value> {
+    fn get_value_from_expr(&mut self, scope: &Rc<Scope>, ex: &Expr) -> Option<Value> {
         match ex {
-            Expr::Literal(l) => Some(Value::Primitive(ArcPrimitive::from(l))),
+            Expr::Literal(l) => Some(Value::Primitive(RcPrimitive::from(l))),
             Expr::Ident(i) => scope.get_variable(&i.value)?.into(),
             _ => {
                 let s = format!("{:?} not implemented", ex);
@@ -267,11 +267,11 @@ impl JSEngine {
         }
     }
 
-    pub fn set_register(&mut self, register: Register, value: Option<ArcPrimitive>) {
+    pub fn set_register(&mut self, register: Register, value: Option<RcPrimitive>) {
         let _ = self.registers.entry(register).and_modify(|e| *e = value);
     }
 
-    pub fn get_register(&self, register: Register) -> Option<ArcPrimitive> {
+    pub fn get_register(&self, register: Register) -> Option<RcPrimitive> {
         self.registers.get(&register).and_then(|v| v.clone())
     }
 }
@@ -311,8 +311,8 @@ impl std::fmt::Display for JSEngine {
     }
 }
 
-impl From<ArcPrimitive> for Option<Value> {
-    fn from(value: ArcPrimitive) -> Self {
+impl From<RcPrimitive> for Option<Value> {
+    fn from(value: RcPrimitive) -> Self {
         Some(Value::Primitive(value))
     }
 }
@@ -334,12 +334,12 @@ mod tests {
     fn test_engine() {
         let mut engine = JSEngine::new();
         engine.exec(SOURCE).unwrap();
-        assert!(engine.scope.get_variable("a") == Some(ArcPrimitive::from(1.0)));
-        assert!(engine.scope.get_variable("b") == Some(ArcPrimitive::from(13.0)));
+        assert!(engine.scope.get_variable("a") == Some(RcPrimitive::from(1.0)));
+        assert!(engine.scope.get_variable("b") == Some(RcPrimitive::from(13.0)));
     }
 
     /// Run `src` and return the value of variable `name` afterwards.
-    fn run(src: &str, name: &str) -> ArcPrimitive {
+    fn run(src: &str, name: &str) -> RcPrimitive {
         let mut engine = JSEngine::new();
         engine.exec(src).unwrap();
         engine
@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn test_assign_ops() {
         for (src, expected) in [
-            ("let x = 10; x = 3", ArcPrimitive::from(3.0)),
+            ("let x = 10; x = 3", RcPrimitive::from(3.0)),
             ("let x = 10; x += 3", 13.0.into()),
             ("let x = 'a'; x += 'b'", "ab".into()),
             ("let x = 10; x -= 3", 7.0.into()),
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn test_binary_ops_in_expressions() {
         for (src, expected) in [
-            ("let r = 10 - 2 * 3", ArcPrimitive::from(4.0)),
+            ("let r = 10 - 2 * 3", RcPrimitive::from(4.0)),
             ("let r = 10 - 2 - 3", 5.0.into()),
             ("let r = 2 ** 3 ** 2", 512.0.into()),
             (

@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use crate::primitive::ArcPrimitive;
+use crate::primitive::RcPrimitive;
 
 #[derive(Debug, Clone)]
 pub enum StackValue {
     Number(isize),
-    Value(ArcPrimitive),
+    Value(RcPrimitive),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,8 +33,8 @@ impl From<isize> for StackValue {
     }
 }
 
-impl From<ArcPrimitive> for StackValue {
-    fn from(value: ArcPrimitive) -> Self {
+impl From<RcPrimitive> for StackValue {
+    fn from(value: RcPrimitive) -> Self {
         Self::Value(value)
     }
 }

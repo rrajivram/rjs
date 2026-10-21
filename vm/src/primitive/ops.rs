@@ -8,12 +8,12 @@ use std::{
     borrow::Cow,
     cmp::Ordering,
     ops::{BitAnd, BitOr, BitXor, Div, Mul, Rem, Shl, Shr, Sub},
-    sync::Arc,
+    rc::Rc,
 };
 
 use crate::{
     error::JSError,
-    primitive::{ArcPrimitive, Primitive},
+    primitive::{RcPrimitive, Primitive},
 };
 
 /// A value after ToNumeric: arithmetic works on either, but never a mix.
@@ -314,7 +314,7 @@ fn numeric_op(
     rhs: &Primitive,
     number: impl FnOnce(f64, f64) -> f64,
     bigint: impl FnOnce(i128, i128) -> Result<i128, JSError>,
-) -> Result<ArcPrimitive, JSError> {
+) -> Result<RcPrimitive, JSError> {
     match (lhs.to_numeric()?, rhs.to_numeric()?) {
         (Numeric::Number(a), Numeric::Number(b)) => Ok(Primitive::Number(number(a, b)).into()),
         (Numeric::BigInt(a), Numeric::BigInt(b)) => Ok(Primitive::BigInt(bigint(a, b)?).into()),
@@ -350,8 +350,8 @@ fn less_than(a: &Primitive, b: &Primitive) -> Result<Option<bool>, JSError> {
 
 macro_rules! numeric_operator {
     ($trait:ident, $method:ident, $number:expr, $bigint:expr) => {
-        impl $trait for ArcPrimitive {
-            type Output = Result<ArcPrimitive, JSError>;
+        impl $trait for RcPrimitive {
+            type Output = Result<RcPrimitive, JSError>;
 
             fn $method(self, rhs: Self) -> Self::Output {
                 numeric_op(&self.0, &rhs.0, $number, $bigint)
@@ -402,7 +402,7 @@ numeric_operator!(
     |a: i128, b: i128| bigint_shl(a, b.checked_neg().unwrap_or(i128::MAX))
 );
 
-impl ArcPrimitive {
+impl RcPrimitive {
     pub(crate) fn undefined() -> Self {
         Primitive::Undefined.into()
     }
@@ -453,7 +453,7 @@ impl ArcPrimitive {
             (Primitive::Symbol(a), Primitive::Symbol(b)) => a == b,
             (Primitive::Null, Primitive::Null) | (Primitive::Undefined, Primitive::Undefined) => true,
             (Primitive::Object(_), Primitive::Object(_)) | (Primitive::Function, Primitive::Function) => {
-                Arc::ptr_eq(&self.0, &rhs.0)
+                Rc::ptr_eq(&self.0, &rhs.0)
             }
             _ => false,
         }
@@ -472,14 +472,14 @@ impl ArcPrimitive {
             (P::Null | P::Undefined, _) | (_, P::Null | P::Undefined) => false,
             (P::Number(n), P::Str(s)) | (P::Str(s), P::Number(n)) => *n == string_to_number(s),
             (P::BigInt(n), P::Str(s)) | (P::Str(s), P::BigInt(n)) => string_to_bigint(s) == Some(*n),
-            (P::Bool(b), _) => ArcPrimitive::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
-            (_, P::Bool(b)) => self.loose_equals(&ArcPrimitive::from(if *b { 1.0 } else { 0.0 })),
+            (P::Bool(b), _) => RcPrimitive::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
+            (_, P::Bool(b)) => self.loose_equals(&RcPrimitive::from(if *b { 1.0 } else { 0.0 })),
             (P::Object(_) | P::Function, P::Object(_) | P::Function) => false,
             (P::Object(_) | P::Function, _) => {
-                ArcPrimitive::from(x.to_primitive().into_owned()).loose_equals(rhs)
+                RcPrimitive::from(x.to_primitive().into_owned()).loose_equals(rhs)
             }
             (_, P::Object(_) | P::Function) => {
-                self.loose_equals(&ArcPrimitive::from(y.to_primitive().into_owned()))
+                self.loose_equals(&RcPrimitive::from(y.to_primitive().into_owned()))
             }
             (P::BigInt(a), P::Number(b)) | (P::Number(b), P::BigInt(a)) => {
                 bigint_cmp_number(*a, *b) == Some(Ordering::Equal)

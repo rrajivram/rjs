@@ -1,4 +1,4 @@
-use std::{ops::Add, sync::Arc};
+use std::{ops::Add, rc::Rc};
 
 use rjs_core::{expr::BinaryOp, ident::ObjectName};
 
@@ -8,7 +8,7 @@ use crate::{
         engine::{JSEngine, Register},
         scope::Scope,
     },
-    primitive::{ArcPrimitive, Primitive},
+    primitive::{RcPrimitive, Primitive},
 };
 
 #[derive(Debug, Clone)]
@@ -35,11 +35,11 @@ pub struct Set {
 pub enum Value {
     Register(Register),
     Var(String),
-    Primitive(ArcPrimitive),
+    Primitive(RcPrimitive),
 }
 
 impl Instruction {
-    pub fn exec(&self, engine: &mut JSEngine, scope: &Arc<Scope>) -> Result<(), JSError> {
+    pub fn exec(&self, engine: &mut JSEngine, scope: &Rc<Scope>) -> Result<(), JSError> {
         match self {
             Self::Set(s) => self.set(engine, scope, s)?,
             Self::Binary(b) => self.binary(engine, scope, b)?,
@@ -47,7 +47,7 @@ impl Instruction {
         Ok(())
     }
 
-    fn set(&self, engine: &mut JSEngine, scope: &Arc<Scope>, set: &Set) -> Result<(), JSError> {
+    fn set(&self, engine: &mut JSEngine, scope: &Rc<Scope>, set: &Set) -> Result<(), JSError> {
         match (&set.l_value, &set.r_value) {
             (Value::Var(r), Some(Value::Primitive(p))) => scope.add_variable(
                 r,
@@ -77,7 +77,7 @@ impl Instruction {
     fn binary(
         &self,
         engine: &mut JSEngine,
-        scope: &Arc<Scope>,
+        scope: &Rc<Scope>,
         binary: &Binary,
     ) -> Result<(), JSError> {
         let reg = match &binary.op {
@@ -120,15 +120,15 @@ impl Instruction {
     }
 }
 
-impl From<ArcPrimitive> for Value {
-    fn from(value: ArcPrimitive) -> Self {
+impl From<RcPrimitive> for Value {
+    fn from(value: RcPrimitive) -> Self {
         Self::Primitive(value)
     }
 }
 
 impl From<f64> for Value {
     fn from(value: f64) -> Self {
-        Self::Primitive(ArcPrimitive::from(value))
+        Self::Primitive(RcPrimitive::from(value))
     }
 }
 
@@ -137,14 +137,14 @@ impl Value {
         &self,
         rhs: &Self,
         engine: &mut JSEngine,
-        scope: &Arc<Scope>,
-    ) -> Result<ArcPrimitive, JSError> {
+        scope: &Rc<Scope>,
+    ) -> Result<RcPrimitive, JSError> {
         let (p1, p2) = self.get_vars(&rhs, engine, scope);
         let v = match (p1, p2) {
             (Some(p1), Some(p2)) => p1 + p2,
             (Some(p1), _) => p1,
             (_, Some(p2)) => p2,
-            (None, None) => ArcPrimitive::from(Primitive::Undefined),
+            (None, None) => RcPrimitive::from(Primitive::Undefined),
         };
         Ok(v.into())
     }
@@ -155,13 +155,13 @@ impl Value {
         &self,
         rhs: &Self,
         engine: &mut JSEngine,
-        scope: &Arc<Scope>,
-        op: impl FnOnce(ArcPrimitive, ArcPrimitive) -> Result<ArcPrimitive, JSError>,
-    ) -> Result<ArcPrimitive, JSError> {
+        scope: &Rc<Scope>,
+        op: impl FnOnce(RcPrimitive, RcPrimitive) -> Result<RcPrimitive, JSError>,
+    ) -> Result<RcPrimitive, JSError> {
         let (p1, p2) = self.get_vars(rhs, engine, scope);
         op(
-            p1.unwrap_or_else(ArcPrimitive::undefined),
-            p2.unwrap_or_else(ArcPrimitive::undefined),
+            p1.unwrap_or_else(RcPrimitive::undefined),
+            p2.unwrap_or_else(RcPrimitive::undefined),
         )
     }
 
@@ -169,8 +169,8 @@ impl Value {
         &self,
         rhs: &Self,
         engine: &mut JSEngine,
-        scope: &Arc<Scope>,
-    ) -> (Option<ArcPrimitive>, Option<ArcPrimitive>) {
+        scope: &Rc<Scope>,
+    ) -> (Option<RcPrimitive>, Option<RcPrimitive>) {
         let p1 = match self {
             Value::Primitive(p) => Some(p.clone()),
             Value::Register(r) => engine.get_register(*r),
@@ -184,7 +184,7 @@ impl Value {
         (p1, p2)
     }
 
-    pub fn do_from(value: ArcPrimitive) -> Self {
+    pub fn do_from(value: RcPrimitive) -> Self {
         value.into()
     }
 }
@@ -209,17 +209,17 @@ mod tests {
         let mut engine = engine();
         let set = Instruction::Set(Set {
             l_value: Value::Register(Register::AX),
-            r_value: Some(ArcPrimitive::from(1.0).into()),
+            r_value: Some(RcPrimitive::from(1.0).into()),
         });
         let scope = engine.scope.clone();
         set.exec(&mut engine, &scope).unwrap();
-        assert!(engine.get_register(Register::AX) == Some(ArcPrimitive::from(1.0)));
+        assert!(engine.get_register(Register::AX) == Some(RcPrimitive::from(1.0)));
         let set = Instruction::Set(Set {
             l_value: Value::Var("test".into()),
-            r_value: Some(ArcPrimitive::from(2.0).into()),
+            r_value: Some(RcPrimitive::from(2.0).into()),
         });
         set.exec(&mut engine, &scope).unwrap();
-        assert!(scope.get_variable("test") == Some(ArcPrimitive::from(2.0)));
+        assert!(scope.get_variable("test") == Some(RcPrimitive::from(2.0)));
     }
 
     #[test]
@@ -238,10 +238,10 @@ mod tests {
 
     /// Run `left op right` as a `Binary` instruction and return the result.
     fn eval(
-        left: impl Into<ArcPrimitive>,
+        left: impl Into<RcPrimitive>,
         op: BinaryOp,
-        right: impl Into<ArcPrimitive>,
-    ) -> Result<ArcPrimitive, JSError> {
+        right: impl Into<RcPrimitive>,
+    ) -> Result<RcPrimitive, JSError> {
         let mut engine = engine();
         let scope = engine.scope.clone();
         Instruction::Binary(Binary {
@@ -254,14 +254,14 @@ mod tests {
         Ok(engine.get_register(Register::CX).expect("result register is set"))
     }
 
-    fn num(left: impl Into<ArcPrimitive>, op: BinaryOp, right: impl Into<ArcPrimitive>) -> f64 {
+    fn num(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> f64 {
         match eval(left, op, right).unwrap().as_ref() {
             Primitive::Number(n) => *n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
-    fn boolean(left: impl Into<ArcPrimitive>, op: BinaryOp, right: impl Into<ArcPrimitive>) -> bool {
+    fn boolean(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> bool {
         match eval(left, op, right).unwrap().as_ref() {
             Primitive::Bool(b) => *b,
             other => panic!("expected a boolean, got {other:?}"),
@@ -272,21 +272,21 @@ mod tests {
         Primitive::BigInt(n)
     }
 
-    fn bigint(left: impl Into<ArcPrimitive>, op: BinaryOp, right: impl Into<ArcPrimitive>) -> i128 {
+    fn bigint(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> i128 {
         match eval(left, op, right).unwrap().as_ref() {
             Primitive::BigInt(n) => *n,
             other => panic!("expected a BigInt, got {other:?}"),
         }
     }
 
-    fn type_error(left: impl Into<ArcPrimitive>, op: BinaryOp, right: impl Into<ArcPrimitive>) -> String {
+    fn type_error(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> String {
         match eval(left, op, right) {
             Err(JSError::TypeError(m)) => m,
             other => panic!("expected a TypeError, got {other:?}"),
         }
     }
 
-    fn range_error(left: impl Into<ArcPrimitive>, op: BinaryOp, right: impl Into<ArcPrimitive>) -> String {
+    fn range_error(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> String {
         match eval(left, op, right) {
             Err(JSError::RangeError(m)) => m,
             other => panic!("expected a RangeError, got {other:?}"),
@@ -462,8 +462,8 @@ mod tests {
     fn test_objects_compare_by_identity() {
         let mut engine = engine();
         let scope = engine.scope.clone();
-        let object = ArcPrimitive::from(Primitive::Object(Object::new(Default::default())));
-        let lookalike = ArcPrimitive::from(Primitive::Object(Object::new(Default::default())));
+        let object = RcPrimitive::from(Primitive::Object(Object::new(Default::default())));
+        let lookalike = RcPrimitive::from(Primitive::Object(Object::new(Default::default())));
         let same = Instruction::Binary(Binary {
             left: object.clone().into(),
             op: BinaryOp::StrictEq,
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_in() {
-        let props = [("a".to_string(), ArcPrimitive::from(1.0)), ("0".to_string(), 2.0.into())];
+        let props = [("a".to_string(), RcPrimitive::from(1.0)), ("0".to_string(), 2.0.into())];
         let object = || Primitive::Object(Object::new(props.clone().into_iter().collect()));
         assert!(boolean("a", BinaryOp::In, object()));
         assert!(!boolean("b", BinaryOp::In, object()));

@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, default, fmt::Display, hash::Hash, ops::Add, sync::Arc};
+use std::{cmp::Ordering, default, fmt::Display, hash::Hash, ops::Add, rc::Rc};
 
 use rjs_core::literal::{Literal, NumberLiteral, NumberValue};
 
@@ -25,7 +25,7 @@ pub enum Primitive {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArcPrimitive(pub Arc<Primitive>);
+pub struct RcPrimitive(pub Rc<Primitive>);
 
 impl Ord for Primitive {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -90,13 +90,13 @@ impl Display for Primitive {
     }
 }
 
-impl Default for ArcPrimitive {
+impl Default for RcPrimitive {
     fn default() -> Self {
-        Self(Arc::new(Primitive::Number(0.)))
+        Self(Rc::new(Primitive::Number(0.)))
     }
 }
 
-impl Add for ArcPrimitive {
+impl Add for RcPrimitive {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         let res: Self = match (self.0.as_ref(), rhs.0.as_ref()) {
@@ -122,19 +122,19 @@ impl Add for ArcPrimitive {
     }
 }
 
-impl From<Primitive> for ArcPrimitive {
+impl From<Primitive> for RcPrimitive {
     fn from(value: Primitive) -> Self {
-        Self(Arc::new(value))
+        Self(Rc::new(value))
     }
 }
 
-impl Display for ArcPrimitive {
+impl Display for RcPrimitive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl From<&Literal> for ArcPrimitive {
+impl From<&Literal> for RcPrimitive {
     fn from(value: &Literal) -> Self {
         let val = match value {
             Literal::Boolean(b) => Primitive::Bool(b.value()),
@@ -145,40 +145,40 @@ impl From<&Literal> for ArcPrimitive {
             },
             Literal::String(s) => Primitive::Str(s.value.clone()),
         };
-        Self(Arc::new(val))
+        Self(Rc::new(val))
     }
 }
-impl From<Literal> for ArcPrimitive {
+impl From<Literal> for RcPrimitive {
     fn from(value: Literal) -> Self {
         Self::from(&value)
     }
 }
 
-impl From<f64> for ArcPrimitive {
+impl From<f64> for RcPrimitive {
     fn from(value: f64) -> Self {
-        Self(Arc::new(Primitive::Number(value)))
+        Self(Rc::new(Primitive::Number(value)))
     }
 }
 
-impl From<bool> for ArcPrimitive {
+impl From<bool> for RcPrimitive {
     fn from(value: bool) -> Self {
-        Self(Arc::new(Primitive::Bool(value)))
+        Self(Rc::new(Primitive::Bool(value)))
     }
 }
 
-impl From<String> for ArcPrimitive {
+impl From<String> for RcPrimitive {
     fn from(value: String) -> Self {
-        Self(Arc::new(Primitive::Str(value)))
+        Self(Rc::new(Primitive::Str(value)))
     }
 }
 
-impl From<&str> for ArcPrimitive {
+impl From<&str> for RcPrimitive {
     fn from(value: &str) -> Self {
-        Self(Arc::new(Primitive::Str(value.to_string())))
+        Self(Rc::new(Primitive::Str(value.to_string())))
     }
 }
 
-impl AsRef<Primitive> for ArcPrimitive {
+impl AsRef<Primitive> for RcPrimitive {
     fn as_ref(&self) -> &Primitive {
         &self.0
     }
