@@ -4,14 +4,15 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use rjs_core::{keyword::VAR, statement::DeclKind};
+use rjs_core::statement::DeclKind;
 
 use crate::{
+    builtin::console::Console,
     error::JSError,
-    primitive::{RcPrimitive, Primitive},
+    primitive::{Primitive, RcPrimitive},
 };
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Scope {
     pub vars: RefCell<HashMap<String, Rc<RefCell<Variable>>>>,
     pub child_scopes: RefCell<Vec<Rc<Scope>>>,
@@ -26,32 +27,25 @@ pub enum VariableType {
     Any,
 }
 
-#[derive(Clone)]
+#[allow(unused)]
+#[derive(Clone, Debug)]
 pub struct Variable {
     name: String,
     vtype: VariableType,
-    value: Option<RcPrimitive>,
+    value: RcPrimitive,
     parent: Weak<Scope>,
 }
 
 impl Variable {
     pub fn to_string(&self) -> Result<String, JSError> {
-        let res = match &self.value {
-            Some(v) => {
-                format!("{}", v)
-            }
-            None => match self.vtype {
-                VariableType::Const => return Err(JSError::RefereneError(self.name.clone())),
-                _ => "undefined".into(),
-            },
-        };
+        let res = format!("{}", self.value);
         Ok(res)
     }
 
     pub fn new(
         name: &str,
         vtype: VariableType,
-        value: Option<RcPrimitive>,
+        value: RcPrimitive,
         parent: Weak<Scope>,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
@@ -62,22 +56,33 @@ impl Variable {
         }))
     }
 
-    pub fn set(&mut self, value: Option<RcPrimitive>) -> Result<(), JSError> {
-        if let VariableType::Const = self.vtype
-            && let Some(_v) = &self.value
-        {
+    pub fn set(&mut self, value: RcPrimitive) -> Result<(), JSError> {
+        if let VariableType::Const = self.vtype {
             return Err(JSError::InvalidReassign(self.name.clone()));
         }
         self.value = value;
         Ok(())
     }
 
-    pub fn get(&self, name: &str) -> Result<Option<Rc<RefCell<Self>>>, JSError> {
+    pub fn get(&self, _name: &str) -> Result<Option<Rc<RefCell<Self>>>, JSError> {
         todo!()
     }
 }
 
 impl Scope {
+    pub fn create_default() -> Rc<Self> {
+        let this = Rc::new(Self {
+            vars: RefCell::new(HashMap::new()),
+            child_scopes: RefCell::new(vec![]),
+            parent: None,
+            temp_var: Cell::new(0),
+        });
+        let console = Primitive::Object(Rc::new(Console::new()));
+        this.add_variable("console", VariableType::Const, RcPrimitive::from(console))
+            .unwrap();
+        this
+    }
+
     pub fn create(parent: Rc<Scope>) -> Rc<Self> {
         let this = Rc::new(Self {
             parent: Some(Rc::downgrade(&parent)),
@@ -91,7 +96,7 @@ impl Scope {
         let next_var = self.temp_var.get();
         self.temp_var.set(next_var + 1);
         let next_var = format!("__t{next_var}");
-        let _ = self.add_variable(&next_var, VariableType::Any, None);
+        let _ = self.add_variable(&next_var, VariableType::Any, Primitive::Undefined.into());
         next_var
     }
 
@@ -99,30 +104,27 @@ impl Scope {
         self: &Rc<Self>,
         name: &str,
         vtype: VariableType,
-        value: Option<RcPrimitive>,
+        value: RcPrimitive,
     ) -> Result<(), JSError> {
         let var = Variable::new(name, vtype, value, Rc::downgrade(self));
         self.vars.borrow_mut().insert(name.into(), var);
         Ok(())
     }
 
-    pub fn get_variable(self: &Rc<Self>, name: &str) -> Option<RcPrimitive> {
-        if let Some(var) = self.vars.borrow().get(name)
-            && let Some(v) = &var.borrow().value
-        {
-            Some(v.clone())
+    #[allow(clippy::bind_instead_of_map)]
+    pub fn get_variable(self: &Rc<Self>, name: &str) -> Result<RcPrimitive, JSError> {
+        if let Some(var) = self.vars.borrow().get(name) {
+            Ok(var.borrow().value.clone())
         } else {
             self.parent
                 .as_ref()
-                .and_then(|p| p.upgrade().and_then(|p| p.get_variable(name)))
+                .and_then(|p| p.upgrade().and_then(|p| Some(p.get_variable(name))))
+                .transpose()?
+                .ok_or(JSError::ReferenceError(name.into()))
         }
     }
 
-    pub fn set_variable(
-        self: &Rc<Self>,
-        name: &str,
-        value: Option<RcPrimitive>,
-    ) -> Result<(), JSError> {
+    pub fn set_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
         // Release the map borrow before mutating the variable.
         let var = self.vars.borrow().get(name).cloned();
         if let Some(var) = var {
@@ -162,10 +164,7 @@ impl std::fmt::Display for VariableType {
 impl std::fmt::Display for Variable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {} = ", self.vtype, self.name)?;
-        match &self.value {
-            Some(v) => write!(f, "{v}"),
-            None => f.write_str("<uninitialized>"),
-        }
+        write!(f, "{}", self.value)
     }
 }
 
@@ -197,22 +196,21 @@ impl std::fmt::Display for Scope {
 mod tests {
     use std::rc::Rc;
 
-    use crate::{executor::scope::Scope, primitive::RcPrimitive};
+    use crate::{error::JSError, executor::scope::Scope, primitive::RcPrimitive};
 
     #[test]
     fn test_scope_var() {
         let scope = Rc::new(Scope::default());
         scope
-            .add_variable(
-                "test",
-                super::VariableType::Any,
-                Some(RcPrimitive::from(1.)),
-            )
+            .add_variable("test", super::VariableType::Any, RcPrimitive::from(1.))
             .unwrap();
-        let v = scope.get_variable("test");
-        assert!(v.is_some() && v.as_ref() == Some(&RcPrimitive::from(1.)));
-        assert!(v.is_some() && v.as_ref() != Some(&RcPrimitive::from(2.)));
-        assert!(scope.get_variable("test1").is_none());
+        let v = scope.get_variable("test").unwrap();
+        assert!(v == RcPrimitive::from(1.));
+        assert!(v != RcPrimitive::from(2.));
+        assert!(matches!(
+            scope.get_variable("test1"),
+            Err(JSError::ReferenceError(_))
+        ));
     }
 
     #[test]
@@ -222,34 +220,31 @@ mod tests {
             .add_variable(
                 "test",
                 crate::executor::scope::VariableType::Any,
-                Some(RcPrimitive::from(2.0)),
+                RcPrimitive::from(2.0),
             )
             .unwrap();
         let child = Scope::create(scope.clone());
         child
-            .add_variable(
-                "test1",
-                super::VariableType::Any,
-                Some(RcPrimitive::from(1.0)),
-            )
+            .add_variable("test1", super::VariableType::Any, RcPrimitive::from(1.0))
             .unwrap();
-        let v = child.get_variable("test1");
-        assert!(v.is_some() && v.as_ref() == Some(&RcPrimitive::from(1.0)));
-        let v = child.get_variable("test");
-        assert!(v.is_some() && v.as_ref() == Some(&RcPrimitive::from(2.0)));
-        assert!(scope.get_variable("test1").is_none());
+        assert!(child.get_variable("test1").unwrap() == RcPrimitive::from(1.0));
+        assert!(child.get_variable("test").unwrap() == RcPrimitive::from(2.0));
+        assert!(matches!(
+            scope.get_variable("test1"),
+            Err(JSError::ReferenceError(_))
+        ));
     }
 
     #[test]
     fn test_set_variable_while_shared() {
         let scope = Rc::new(Scope::default());
         scope
-            .add_variable("x", super::VariableType::Let, Some(RcPrimitive::from(1.0)))
+            .add_variable("x", super::VariableType::Let, RcPrimitive::from(1.0))
             .unwrap();
         // A second handle to the variable, as a closure capturing it would hold.
         let _shared = scope.vars.borrow()["x"].clone();
-        scope.set_variable("x", Some(RcPrimitive::from(2.0))).unwrap();
-        assert_eq!(scope.get_variable("x"), Some(RcPrimitive::from(2.0)));
+        scope.set_variable("x", RcPrimitive::from(2.0)).unwrap();
+        assert_eq!(scope.get_variable("x").unwrap(), RcPrimitive::from(2.0));
     }
 
     #[test]

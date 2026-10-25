@@ -10,10 +10,14 @@ pub enum JSError {
     BadJavascript(Vec<String>),
     #[error("Object not found : {0}")]
     ObjectNotFound(String),
+    #[error("No such method : {0}")]
+    MethodNotFound(String),
+    #[error("No such property : {0}")]
+    ReferenceError(String),
     #[error("TypeError: {0}")]
     TypeError(String),
     #[error("RangeError: {0}")]
     RangeError(String),
-    #[error("Unknown Error")]
-    UnknownError,
+    #[error("Unknown Error {0}")]
+    UnknownError(String),
 }

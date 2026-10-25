@@ -5,8 +5,9 @@ pub struct Symbol {
     name: Option<String>,
     value: u64,
 }
-
+#[allow(unused)]
 static SYMBOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[allow(unused)]
 impl Symbol {
     fn new(name: Option<String>) -> Self {
         Self {

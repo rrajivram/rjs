@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     error::JSError,
-    primitive::{RcPrimitive, Primitive},
+    primitive::{Primitive, RcPrimitive},
 };
 
 /// A value after ToNumeric: arithmetic works on either, but never a mix.
@@ -99,7 +99,9 @@ fn string_to_bigint(s: &str) -> Option<i128> {
         return Some(0);
     }
     match radix_digits(s) {
-        Some((digits, radix)) if !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)) => {
+        Some((digits, radix))
+            if !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)) =>
+        {
             i128::from_str_radix(digits, radix).ok()
         }
         Some(_) => None,
@@ -129,7 +131,11 @@ pub fn number_to_string(n: f64) -> String {
     let body = if k <= point && point <= 21 {
         format!("{digits}{}", "0".repeat((point - k) as usize))
     } else if 0 < point && point <= 21 {
-        format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+        format!(
+            "{}.{}",
+            &digits[..point as usize],
+            &digits[point as usize..]
+        )
     } else if -6 < point && point <= 0 {
         format!("0.{}{digits}", "0".repeat((-point) as usize))
     } else {
@@ -249,7 +255,7 @@ impl Primitive {
             Primitive::Str(s) => !s.is_empty(),
             Primitive::Bool(b) => *b,
             Primitive::Null | Primitive::Undefined => false,
-            Primitive::Symbol(_) | Primitive::Object(_) | Primitive::Function => true,
+            Primitive::Symbol(_) | Primitive::Object(_) | Primitive::Function(_) => true,
         }
     }
 
@@ -258,9 +264,9 @@ impl Primitive {
     fn to_primitive(&self) -> Cow<'_, Primitive> {
         match self {
             Primitive::Object(_) => Cow::Owned(Primitive::Str("[object Object]".into())),
-            Primitive::Function => {
-                Cow::Owned(Primitive::Str("function () { [native code] }".into()))
-            }
+            Primitive::Function(f) => Cow::Owned(Primitive::Str(format!(
+                "function {f}() {{ [native code] }}"
+            ))),
             other => Cow::Borrowed(other),
         }
     }
@@ -277,7 +283,7 @@ impl Primitive {
             Primitive::Symbol(_) => {
                 return Err(type_error("Cannot convert a Symbol value to a string"));
             }
-            Primitive::Object(_) | Primitive::Function => {
+            Primitive::Object(_) | Primitive::Function(_) => {
                 return self.to_primitive().to_js_string();
             }
         })
@@ -293,7 +299,7 @@ impl Primitive {
             Primitive::Undefined => Ok(f64::NAN),
             Primitive::BigInt(_) => Err(type_error("Cannot convert a BigInt value to a number")),
             Primitive::Symbol(_) => Err(type_error("Cannot convert a Symbol value to a number")),
-            Primitive::Object(_) | Primitive::Function => self.to_primitive().to_number(),
+            Primitive::Object(_) | Primitive::Function(_) => self.to_primitive().to_number(),
         }
     }
 
@@ -360,8 +366,12 @@ macro_rules! numeric_operator {
     };
 }
 
-numeric_operator!(Sub, sub, |a, b| a - b, |a: i128, b| a.checked_sub(b).ok_or_else(overflow));
-numeric_operator!(Mul, mul, |a, b| a * b, |a: i128, b| a.checked_mul(b).ok_or_else(overflow));
+numeric_operator!(Sub, sub, |a, b| a - b, |a: i128, b| a
+    .checked_sub(b)
+    .ok_or_else(overflow));
+numeric_operator!(Mul, mul, |a, b| a * b, |a: i128, b| a
+    .checked_mul(b)
+    .ok_or_else(overflow));
 numeric_operator!(Div, div, |a, b| a / b, |a: i128, b| match b {
     0 => Err(division_by_zero()),
     _ => a.checked_div(b).ok_or_else(overflow),
@@ -403,6 +413,7 @@ numeric_operator!(
 );
 
 impl RcPrimitive {
+    #[allow(unused)]
     pub(crate) fn undefined() -> Self {
         Primitive::Undefined.into()
     }
@@ -418,7 +429,11 @@ impl RcPrimitive {
             &self.0,
             &rhs.0,
             |a, b| (to_uint32(a) >> shift_count(b)) as f64,
-            |_, _| Err(type_error("BigInts have no unsigned right shift, use >> instead")),
+            |_, _| {
+                Err(type_error(
+                    "BigInts have no unsigned right shift, use >> instead",
+                ))
+            },
         )
     }
 
@@ -451,10 +466,11 @@ impl RcPrimitive {
             (Primitive::Str(a), Primitive::Str(b)) => a == b,
             (Primitive::Bool(a), Primitive::Bool(b)) => a == b,
             (Primitive::Symbol(a), Primitive::Symbol(b)) => a == b,
-            (Primitive::Null, Primitive::Null) | (Primitive::Undefined, Primitive::Undefined) => true,
-            (Primitive::Object(_), Primitive::Object(_)) | (Primitive::Function, Primitive::Function) => {
-                Rc::ptr_eq(&self.0, &rhs.0)
+            (Primitive::Null, Primitive::Null) | (Primitive::Undefined, Primitive::Undefined) => {
+                true
             }
+            (Primitive::Object(_), Primitive::Object(_)) => Rc::ptr_eq(&self.0, &rhs.0),
+            (Primitive::Function(f1), Primitive::Function(f2)) => f1 == f2,
             _ => false,
         }
     }
@@ -471,14 +487,16 @@ impl RcPrimitive {
             (P::Null | P::Undefined, P::Null | P::Undefined) => true,
             (P::Null | P::Undefined, _) | (_, P::Null | P::Undefined) => false,
             (P::Number(n), P::Str(s)) | (P::Str(s), P::Number(n)) => *n == string_to_number(s),
-            (P::BigInt(n), P::Str(s)) | (P::Str(s), P::BigInt(n)) => string_to_bigint(s) == Some(*n),
+            (P::BigInt(n), P::Str(s)) | (P::Str(s), P::BigInt(n)) => {
+                string_to_bigint(s) == Some(*n)
+            }
             (P::Bool(b), _) => RcPrimitive::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
             (_, P::Bool(b)) => self.loose_equals(&RcPrimitive::from(if *b { 1.0 } else { 0.0 })),
-            (P::Object(_) | P::Function, P::Object(_) | P::Function) => false,
-            (P::Object(_) | P::Function, _) => {
+            (P::Object(_) | P::Function(_), P::Object(_) | P::Function(_)) => false,
+            (P::Object(_) | P::Function(_), _) => {
                 RcPrimitive::from(x.to_primitive().into_owned()).loose_equals(rhs)
             }
-            (_, P::Object(_) | P::Function) => {
+            (_, P::Object(_) | P::Function(_)) => {
                 self.loose_equals(&RcPrimitive::from(y.to_primitive().into_owned()))
             }
             (P::BigInt(a), P::Number(b)) | (P::Number(b), P::BigInt(a)) => {
@@ -509,10 +527,10 @@ impl RcPrimitive {
             Primitive::Object(object) => match self.0.as_ref() {
                 // Properties are keyed by string; no object holds a symbol key.
                 Primitive::Symbol(_) => false,
-                key => object.has_property(&key.to_js_string()?),
+                key => object.has_prop(&key.to_js_string()?),
             },
             // Functions carry no properties in this VM.
-            Primitive::Function => false,
+            Primitive::Function(_) => false,
             other => {
                 let key = self.0.to_js_string().unwrap_or_else(|_| "Symbol()".into());
                 let target = other.to_js_string().unwrap_or_else(|_| "Symbol()".into());
@@ -529,9 +547,13 @@ impl RcPrimitive {
         match rhs.0.as_ref() {
             // Objects have no prototype chain in this VM yet, so nothing is
             // an instance of a function. A primitive never is, in any VM.
-            Primitive::Function => Ok(false.into()),
-            Primitive::Object(_) => Err(type_error("Right-hand side of 'instanceof' is not callable")),
-            _ => Err(type_error("Right-hand side of 'instanceof' is not an object")),
+            Primitive::Function(_) => Ok(false.into()),
+            Primitive::Object(_) => Err(type_error(
+                "Right-hand side of 'instanceof' is not callable",
+            )),
+            _ => Err(type_error(
+                "Right-hand side of 'instanceof' is not an object",
+            )),
         }
     }
 }
@@ -559,7 +581,9 @@ mod tests {
         ] {
             assert_eq!(string_to_number(s), n, "{s:?}");
         }
-        for s in ["abc", "inf", "infinity", "NaN", "1_000", "0x", "-0x10", "+-5", ".", "1e", "12px"] {
+        for s in [
+            "abc", "inf", "infinity", "NaN", "1_000", "0x", "-0x10", "+-5", ".", "1e", "12px",
+        ] {
             assert!(string_to_number(s).is_nan(), "{s:?}");
         }
     }
