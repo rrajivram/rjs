@@ -1,35 +1,44 @@
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use crate::{
+    error::JSError,
     executor::instr::Value,
-    primitive::{Func, Primitive, RcPrimitive, objects::Object},
+    primitive::{
+        Primitive, RcPrimitive,
+        func::Func,
+        objects::Object,
+        proto::{Prototype, RcPrototype},
+    },
 };
 
 #[derive(Debug, Clone, Hash)]
-pub struct Console {
-    methods: Vec<String>,
-    props: Vec<RcPrimitive>,
-}
+pub struct Console {}
 
 const LOG: &str = "log";
 const WARN: &str = "warn";
 const ERROR: &str = "error";
 
+thread_local! {
+    static CONSOLE_PROTO: RcPrototype =Prototype::create(HashMap::from([
+        (LOG.into(),RcPrimitive::from(Primitive::Function(LOG.into()))),
+        (WARN.into(),RcPrimitive::from(Primitive::Function(WARN.into()))),
+        (ERROR.into(),RcPrimitive::from(Primitive::Function(ERROR.into()))),
+        ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+    ]),None).into();
+}
+
 #[allow(clippy::new_without_default)]
 impl Console {
     pub fn new() -> Self {
-        Self {
-            methods: Vec::from([LOG.to_string(), WARN.into(), ERROR.into()]),
-            props: vec![
-                RcPrimitive::from(Primitive::Function(LOG.into())),
-                RcPrimitive::from(Primitive::Function(WARN.into())),
-                RcPrimitive::from(Primitive::Function(ERROR.into())),
-            ],
-        }
+        Self {}
     }
 }
 
 impl Object for Console {
+    fn prototype(&self) -> RcPrototype {
+        CONSOLE_PROTO.with(|p| p.clone())
+    }
+
     fn get_props(&self) -> Vec<String> {
         vec![LOG.into(), WARN.into(), ERROR.into()]
     }
@@ -39,20 +48,15 @@ impl Object for Console {
     }
 
     fn has_method(&self, method: &str) -> bool {
-        self.methods.contains(&method.to_string())
+        matches!(method, LOG | WARN | ERROR)
     }
 
     fn get_methods(&self) -> Vec<String> {
-        self.methods.clone()
+        todo!()
     }
 
-    fn get_prop(&self, prop: &str) -> Result<crate::primitive::RcPrimitive, crate::error::JSError> {
-        match prop {
-            LOG => Ok(self.props[0].clone()),
-            WARN => Ok(self.props[1].clone()),
-            ERROR => Ok(self.props[2].clone()),
-            _ => Err(crate::error::JSError::RefereneError(prop.into())),
-        }
+    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError> {
+        self.prototype().0.borrow().get(prop)
     }
 
     fn call(
@@ -61,7 +65,7 @@ impl Object for Console {
         scope: &Rc<crate::executor::scope::Scope>,
         method: &Func,
         args: &[Value],
-    ) -> Result<(), crate::error::JSError> {
+    ) -> Result<(), JSError> {
         let pref = match method.as_ref() {
             "log" => "",
             "warn" => "WARN: ",
@@ -71,7 +75,7 @@ impl Object for Console {
         print!("{pref}");
         for arg in args {
             let arg = engine.resolve_value(arg, scope)?;
-            print!("{arg}");
+            print!("{arg} ");
         }
         println!();
         Ok(())

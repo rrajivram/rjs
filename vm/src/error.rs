@@ -18,6 +18,8 @@ pub enum JSError {
     TypeError(String),
     #[error("RangeError: {0}")]
     RangeError(String),
+    #[error("Not supported yet: {0}")]
+    NotSupported(String),
     #[error("Unknown Error {0}")]
     UnknownError(String),
 }

@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     rc::{Rc, Weak},
 };
@@ -7,7 +7,7 @@ use std::{
 use rjs_core::statement::DeclKind;
 
 use crate::{
-    builtin::console::Console,
+    builtin::{array::Array, console::Console},
     error::JSError,
     primitive::{Primitive, RcPrimitive},
 };
@@ -17,7 +17,6 @@ pub struct Scope {
     pub vars: RefCell<HashMap<String, Rc<RefCell<Variable>>>>,
     pub child_scopes: RefCell<Vec<Rc<Scope>>>,
     pub parent: Option<Weak<Scope>>,
-    pub temp_var: Cell<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,6 +63,12 @@ impl Variable {
         Ok(())
     }
 
+    /// Give a declared variable its value at its declaration line. Unlike
+    /// `set`, this is allowed for `const`, which is set exactly once this way.
+    pub fn init(&mut self, value: RcPrimitive) {
+        self.value = value;
+    }
+
     pub fn get(&self, _name: &str) -> Result<Option<Rc<RefCell<Self>>>, JSError> {
         todo!()
     }
@@ -75,10 +80,12 @@ impl Scope {
             vars: RefCell::new(HashMap::new()),
             child_scopes: RefCell::new(vec![]),
             parent: None,
-            temp_var: Cell::new(0),
         });
         let console = Primitive::Object(Rc::new(Console::new()));
         this.add_variable("console", VariableType::Const, RcPrimitive::from(console))
+            .unwrap();
+        let array = Primitive::Object(Rc::new(Array::new()));
+        this.add_variable("Array", VariableType::Const, array.into())
             .unwrap();
         this
     }
@@ -90,14 +97,6 @@ impl Scope {
         });
         parent.child_scopes.borrow_mut().push(this.clone());
         this
-    }
-
-    pub fn new_temp_var(self: &Rc<Self>) -> String {
-        let next_var = self.temp_var.get();
-        self.temp_var.set(next_var + 1);
-        let next_var = format!("__t{next_var}");
-        let _ = self.add_variable(&next_var, VariableType::Any, Primitive::Undefined.into());
-        next_var
     }
 
     pub fn add_variable(
@@ -124,20 +123,35 @@ impl Scope {
         }
     }
 
-    pub fn set_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
-        // Release the map borrow before mutating the variable.
-        let var = self.vars.borrow().get(name).cloned();
-        if let Some(var) = var {
-            var.borrow_mut().set(value)?;
-        } else if let Some(p) = self.parent.as_ref()
-            && let Some(parent) = p.upgrade()
-        {
-            parent.set_variable(name, value)?;
-        } else {
-            return Err(JSError::ObjectNotFound(name.into()));
+    /// The nearest variable called `name`, searching outward from this scope.
+    fn find_variable(self: &Rc<Self>, name: &str) -> Option<Rc<RefCell<Variable>>> {
+        // Clone the handle so the map borrow ends before anyone mutates it.
+        if let Some(var) = self.vars.borrow().get(name).cloned() {
+            return Some(var);
         }
+        self.parent.as_ref()?.upgrade()?.find_variable(name)
+    }
 
+    pub fn set_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
+        self.find_variable(name)
+            .ok_or_else(|| JSError::ObjectNotFound(name.into()))?
+            .borrow_mut()
+            .set(value)
+    }
+
+    /// Run a declaration's initializer: like `set_variable`, but allowed for
+    /// `const`.
+    pub fn init_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
+        self.find_variable(name)
+            .ok_or_else(|| JSError::ObjectNotFound(name.into()))?
+            .borrow_mut()
+            .init(value);
         Ok(())
+    }
+
+    /// Whether this scope itself (not a parent) declares `name`.
+    pub fn has_own_variable(&self, name: &str) -> bool {
+        self.vars.borrow().contains_key(name)
     }
 }
 
@@ -245,13 +259,5 @@ mod tests {
         let _shared = scope.vars.borrow()["x"].clone();
         scope.set_variable("x", RcPrimitive::from(2.0)).unwrap();
         assert_eq!(scope.get_variable("x").unwrap(), RcPrimitive::from(2.0));
-    }
-
-    #[test]
-    fn test_temp_var() {
-        let scope = Rc::new(Scope::default());
-        for i in 0..10 {
-            assert!(scope.new_temp_var() == format!("__t{i}"))
-        }
     }
 }

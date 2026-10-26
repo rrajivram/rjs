@@ -1,12 +1,22 @@
-use std::{cell::RefCell, collections::BTreeMap, fmt::Debug, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    rc::Rc,
+};
 
 use crate::{
+    builtin::array::Array,
     error::JSError,
     executor::{engine::JSEngine, instr::Value, scope::Scope},
-    primitive::{Func, Primitive, RcPrimitive},
+    primitive::{
+        Func, Primitive, RcPrimitive,
+        proto::{Prototype, RcPrototype},
+    },
 };
 
 pub trait Object: Debug {
+    fn prototype(&self) -> RcPrototype;
     fn get_props(&self) -> Vec<String>;
     fn get_methods(&self) -> Vec<String>;
     fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError>;
@@ -26,22 +36,63 @@ pub trait Object: Debug {
         Ok(())
     }
     fn type_of(&self) -> String;
+    /// The array behind this object, if it is one.
+    fn as_array(&self) -> Option<&Array> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectPrimitive {
+    prototype: RcPrototype,
     props: RefCell<BTreeMap<String, RcPrimitive>>,
+}
+
+thread_local! {
+    static OBJ_PROTO: RcPrototype = Prototype::create(HashMap::from([
+        ("valueOf".into(),RcPrimitive::from(Primitive::Function("valueOf".into()))),
+        ("toString".into(),RcPrimitive::from(Primitive::Function("toString".into()))),
+        ("typeOf".into(),RcPrimitive::from(Primitive::Function("typeOf".into()))),
+        ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+    ]),None).into();
 }
 
 impl ObjectPrimitive {
     pub fn new(props: BTreeMap<String, RcPrimitive>) -> Self {
+        let prototype = RcPrototype::from(Prototype::create(
+            HashMap::from([
+                (
+                    "valueOf".into(),
+                    RcPrimitive::from(Primitive::Function("valueOf".into())),
+                ),
+                (
+                    "toString".into(),
+                    RcPrimitive::from(Primitive::Function("toString".into())),
+                ),
+                (
+                    "typeOf".into(),
+                    RcPrimitive::from(Primitive::Function("typeOf".into())),
+                ),
+                ("prototype".into(), RcPrimitive::from(Primitive::Undefined)),
+            ]),
+            None,
+        ));
         Self {
             props: RefCell::new(props),
+            prototype,
         }
+    }
+
+    pub fn defaul_prototype() -> RcPrototype {
+        OBJ_PROTO.with(|p| p.clone())
     }
 }
 
 impl Object for ObjectPrimitive {
+    fn prototype(&self) -> RcPrototype {
+        self.prototype.clone()
+    }
+
     fn get_props(&self) -> Vec<String> {
         self.props.borrow().keys().cloned().collect()
     }

@@ -469,7 +469,7 @@ impl RcPrimitive {
             (Primitive::Null, Primitive::Null) | (Primitive::Undefined, Primitive::Undefined) => {
                 true
             }
-            (Primitive::Object(_), Primitive::Object(_)) => Rc::ptr_eq(&self.0, &rhs.0),
+            (Primitive::Object(a), Primitive::Object(b)) => Rc::ptr_eq(a, b),
             (Primitive::Function(f1), Primitive::Function(f2)) => f1 == f2,
             _ => false,
         }

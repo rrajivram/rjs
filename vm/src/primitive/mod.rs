@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
     ops::Add,
@@ -7,13 +9,23 @@ use std::{
 
 use rjs_core::literal::{Literal, NumberValue};
 
-use crate::{error::JSError, executor::instr::Value, primitive::objects::Object};
+use crate::{
+    error::JSError,
+    executor::instr::Value,
+    primitive::{
+        func::Func,
+        objects::Object,
+        proto::{Prototype, RcPrototype},
+    },
+};
 
+pub mod func;
 pub mod jstack;
 pub mod non_numeric;
 pub mod numeric;
 pub mod objects;
 pub mod ops;
+pub mod proto;
 
 #[derive(Debug, Clone)]
 pub enum Primitive {
@@ -27,9 +39,6 @@ pub enum Primitive {
     Object(Rc<dyn Object>),
     Function(Func),
 }
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Func(pub String);
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RcPrimitive(pub Rc<Primitive>);
@@ -190,38 +199,26 @@ impl AsRef<Primitive> for RcPrimitive {
     }
 }
 
-impl AsRef<str> for Func {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for Func {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<String> for Func {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl Display for Func {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)?;
-        Ok(())
-    }
-}
-
 impl Primitive {
     pub fn to_str(&self) -> String {
         format!("{self}")
     }
 }
 
+thread_local! {
+static PRIMITIVE_PROTO:RcPrototype = Prototype::create(HashMap::from([
+    ("valueOf".into(),RcPrimitive::from(Primitive::Function("valueOf".into()))),
+    ("toString".into(),RcPrimitive::from(Primitive::Function("toString".into()))),
+    ("typeOf".into(),RcPrimitive::from(Primitive::Function("typeOf".into()))),
+    ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+]),None).into();
+}
+
 impl Object for Primitive {
+    fn prototype(&self) -> RcPrototype {
+        PRIMITIVE_PROTO.with(|v| v.clone())
+    }
+
     fn get_props(&self) -> Vec<String> {
         todo!()
     }
@@ -260,7 +257,7 @@ impl Object for Primitive {
         scope: &Rc<crate::executor::scope::Scope>,
         method: &Func,
         args: &[Value],
-    ) -> Result<(), crate::error::JSError> {
+    ) -> Result<(), JSError> {
         if let Self::Object(ob) = self {
             Ok(ob.call(engine, scope, method, args)?)
         } else {

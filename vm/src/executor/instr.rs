@@ -6,14 +6,17 @@ use crate::{
     error::JSError,
     executor::{
         engine::{JSEngine, Register},
-        scope::Scope,
+        scope::{Scope, VariableType},
     },
-    primitive::{Primitive, RcPrimitive, objects::Object},
+    primitive::{Primitive, RcPrimitive, jstack::StackValue, objects::Object},
 };
 
 #[derive(Debug, Clone)]
 pub enum Instruction {
     Noop,
+    Hoist(Hoist),
+    Init(Init),
+    Declare(Declare),
     Set(Set),
     Binary(Binary),
     GetAttr(GetAttr), //  Call(Call)
@@ -21,6 +24,10 @@ pub enum Instruction {
     Call(Call),
     JumpIf(JumpIf),
     Jump(Jump),
+    BeginScope,
+    EndScope,
+    Push(Push),
+    Pop(Pop),
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +44,9 @@ pub struct Push {
 }
 
 #[derive(Debug, Clone)]
-pub struct Pop {}
+pub struct Pop {
+    pub value: Option<Value>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Call {
@@ -61,6 +70,34 @@ pub struct SetAttr {
     pub input: Value,
 }
 
+/// Create a scope's declared name at the start of the scope, as `undefined`,
+/// so it's visible before its declaration line. A `var` that already exists
+/// in the scope keeps its value (redeclaring a `var` is a no-op).
+#[derive(Debug, Clone)]
+pub struct Hoist {
+    pub name: String,
+    pub kind: VariableType,
+}
+
+/// Run a declaration's initializer at its line: set the (hoisted) variable,
+/// even if it's `const`.
+#[derive(Debug, Clone)]
+pub struct Init {
+    pub name: String,
+    pub value: Value,
+}
+
+/// Create a variable in the current scope, initialized to `value`
+/// (`undefined` when declared without an initializer).
+#[derive(Debug, Clone)]
+pub struct Declare {
+    pub name: String,
+    pub kind: VariableType,
+    pub value: Value,
+}
+
+/// Assign to an existing variable or a register. Variables are looked up
+/// through enclosing scopes; assigning to an undeclared one is an error.
 #[derive(Debug, Clone)]
 pub struct Set {
     pub l_value: Value,
@@ -101,6 +138,9 @@ impl Instruction {
     ) -> Result<Option<JumpPos>, JSError> {
         let res = match self {
             Self::Noop => None,
+            Self::Hoist(h) => self.hoist(scope, h)?,
+            Self::Init(i) => self.init(engine, scope, i)?,
+            Self::Declare(d) => self.declare(engine, scope, d)?,
             Self::Set(s) => self.set(engine, scope, s)?,
             Self::Binary(b) => self.binary(engine, scope, b)?,
             Self::GetAttr(g) => self.get_attr(engine, scope, g)?,
@@ -108,9 +148,44 @@ impl Instruction {
             Self::Call(c) => self.call(engine, scope, c)?,
             Self::JumpIf(j) => self.jump_if(engine, scope, j)?,
             Self::Jump(j) => self.jump(engine, scope, j)?,
+            Self::Push(p) => self.push(engine, scope, p)?,
+            Self::Pop(p) => self.pop(engine, scope, p)?,
+
+            _ => None,
         };
         Ok(res)
     }
+
+    fn push(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        push: &Push,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = engine.resolve_value(&push.value, scope)?;
+        engine.stack.push(value);
+        Ok(None)
+    }
+
+    fn pop(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        pop: &Pop,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let v = engine.stack.pop();
+        if let Some(v) = v
+            && let Some(out) = &pop.value
+        {
+            let set = Set {
+                l_value: out.clone(),
+                r_value: Value::Primitive(v),
+            };
+            self.set(engine, scope, &set)?;
+        }
+        Ok(None)
+    }
+
     fn jump(
         &self,
         _engine: &mut JSEngine,
@@ -166,9 +241,12 @@ impl Instruction {
             r_value: Value::Primitive(source.as_ref().get_prop(&get.attrib)?),
         };
         self.set(engine, scope, &set)?;
+        // Use the object resolved above: re-resolving `get.object` would read
+        // AX after it was overwritten with the property when the object was
+        // itself in AX.
         let set = Set {
             l_value: get.obj_output.clone(),
-            r_value: get.object.clone(),
+            r_value: Value::Primitive(source),
         };
         self.set(engine, scope, &set)?;
         Ok(None)
@@ -189,6 +267,36 @@ impl Instruction {
         Ok(None)
     }
 
+    fn hoist(&self, scope: &Rc<Scope>, hoist: &Hoist) -> Result<Option<JumpPos>, JSError> {
+        if hoist.kind == VariableType::Any && scope.has_own_variable(&hoist.name) {
+            return Ok(None);
+        }
+        scope.add_variable(&hoist.name, hoist.kind.clone(), Primitive::Undefined.into())?;
+        Ok(None)
+    }
+
+    fn init(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        init: &Init,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = engine.resolve_value(&init.value, scope)?;
+        scope.init_variable(&init.name, value)?;
+        Ok(None)
+    }
+
+    fn declare(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        declare: &Declare,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = engine.resolve_value(&declare.value, scope)?;
+        scope.add_variable(&declare.name, declare.kind.clone(), value)?;
+        Ok(None)
+    }
+
     fn set(
         &self,
         engine: &mut JSEngine,
@@ -196,9 +304,7 @@ impl Instruction {
         set: &Set,
     ) -> Result<Option<JumpPos>, JSError> {
         match (&set.l_value, &set.r_value) {
-            (Value::Var(r), Value::Primitive(p)) => {
-                scope.add_variable(r, crate::executor::scope::VariableType::Any, p.clone())?
-            }
+            (Value::Var(v), Value::Primitive(p)) => scope.set_variable(v, p.clone())?,
             (Value::Var(v), Value::Register(r)) => {
                 scope.set_variable(v, engine.get_register(*r))?
             }
@@ -309,6 +415,12 @@ impl From<Register> for Value {
     }
 }
 
+impl From<usize> for Value {
+    fn from(value: usize) -> Self {
+        Self::Primitive(Primitive::Number(value as f64).into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -340,8 +452,69 @@ mod tests {
             l_value: Value::Var("test".into()),
             r_value: RcPrimitive::from(2.0).into(),
         });
+        assert!(
+            matches!(
+                set.exec(&mut engine, &scope),
+                Err(JSError::ObjectNotFound(_))
+            ),
+            "Set never creates a variable"
+        );
+        Instruction::Declare(Declare {
+            name: "test".into(),
+            kind: VariableType::Let,
+            value: Register::AX.into(),
+        })
+        .exec(&mut engine, &scope)
+        .unwrap();
+        assert!(scope.get_variable("test").unwrap() == RcPrimitive::from(1.0));
         set.exec(&mut engine, &scope).unwrap();
         assert!(scope.get_variable("test").unwrap() == RcPrimitive::from(2.0));
+    }
+
+    #[test]
+    fn test_declare_const() {
+        let mut engine = engine();
+        let scope = engine.scope.clone();
+        Instruction::Declare(Declare {
+            name: "c".into(),
+            kind: VariableType::Const,
+            value: 1.0.into(),
+        })
+        .exec(&mut engine, &scope)
+        .unwrap();
+        assert!(scope.get_variable("c").unwrap() == RcPrimitive::from(1.0));
+        let reassign = Instruction::Set(Set {
+            l_value: Value::Var("c".into()),
+            r_value: 2.0.into(),
+        });
+        assert!(matches!(
+            reassign.exec(&mut engine, &scope),
+            Err(JSError::InvalidReassign(_))
+        ));
+    }
+
+    #[test]
+    fn test_stack_holds_values_not_references() {
+        let mut engine = engine();
+        let scope = engine.scope.clone();
+        scope
+            .add_variable("x", crate::executor::scope::VariableType::Let, 1.0.into())
+            .unwrap();
+        engine.set_register(Register::AX, 10.0.into());
+        for value in [Value::Register(Register::AX), Value::Var("x".into())] {
+            Instruction::Push(Push { value }).exec(&mut engine, &scope).unwrap();
+        }
+        // Change both sources after pushing.
+        engine.set_register(Register::AX, 99.0.into());
+        scope.set_variable("x", 99.0.into()).unwrap();
+        for (expected, register) in [(1.0, Register::BX), (10.0, Register::CX)] {
+            Instruction::Pop(Pop {
+                value: Some(Value::Register(register)),
+            })
+            .exec(&mut engine, &scope)
+            .unwrap();
+            assert_eq!(engine.get_register(register), expected.into());
+        }
     }
 
     #[test]
