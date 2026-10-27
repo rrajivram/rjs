@@ -143,7 +143,10 @@ fn run(opts: &Options) -> Result<(), String> {
         .expect("bench lives inside the workspace")
         .to_path_buf();
     let node_version = version(&opts.node).ok_or_else(|| {
-        format!("can't run `{} --version`; pass --node with the path to Node", opts.node)
+        format!(
+            "can't run `{} --version`; pass --node with the path to Node",
+            opts.node
+        )
     })?;
     // In phase mode each engine runs a wrapper that times its own phases.
     let (rjs, node_args): (PathBuf, Vec<String>) = if opts.phases {
@@ -189,7 +192,10 @@ fn run(opts: &Options) -> Result<(), String> {
         return phases::run(opts, &engines, &templates, &out_dir, &node_version);
     }
 
-    println!("node {node_version}; {} runs per case, median reported", opts.runs);
+    println!(
+        "node {node_version}; {} runs per case, median reported",
+        opts.runs
+    );
     println!("\"above empty\" subtracts the same engine running an empty program.\n");
 
     let empty = out_dir.join("empty.js");
