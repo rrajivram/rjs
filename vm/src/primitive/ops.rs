@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     error::JSError,
-    primitive::{Primitive, RcPrimitive},
+    primitive::{JsValue},
 };
 
 /// A value after ToNumeric: arithmetic works on either, but never a mix.
@@ -240,33 +240,33 @@ fn bigint_cmp_number(x: i128, y: f64) -> Option<Ordering> {
     }
 }
 
-impl Primitive {
+impl JsValue {
     /// `null` or `undefined`: the values `??` and `?.` treat as missing.
     pub fn is_nullish(&self) -> bool {
-        matches!(self, Primitive::Null | Primitive::Undefined)
+        matches!(self, JsValue::Null | JsValue::Undefined)
     }
 
     /// ToBoolean: `false`, `0`, `NaN`, `""`, `0n`, `null` and `undefined` are
     /// falsy; everything else is truthy.
     pub fn to_boolean(&self) -> bool {
         match self {
-            Primitive::Number(n) => *n != 0.0 && !n.is_nan(),
-            Primitive::BigInt(n) => *n != 0,
-            Primitive::Str(s) => !s.is_empty(),
-            Primitive::Bool(b) => *b,
-            Primitive::Null | Primitive::Undefined => false,
-            Primitive::Symbol(_) | Primitive::Object(_) | Primitive::Function(_) => true,
+            JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
+            JsValue::BigInt(n) => *n != 0,
+            JsValue::Str(s) => !s.is_empty(),
+            JsValue::Bool(b) => *b,
+            JsValue::Null | JsValue::Undefined => false,
+            JsValue::Symbol(_) | JsValue::Object(_) | JsValue::Function(_) => true,
         }
     }
 
     /// ToPrimitive. Objects and functions have no user-defined `valueOf` or
     /// `toString` in this VM, so they become their default string form.
-    fn to_primitive(&self) -> Cow<'_, Primitive> {
+    fn to_primitive(&self) -> Cow<'_, JsValue> {
         match self {
-            Primitive::Object(_) => Cow::Owned(Primitive::Str("[object Object]".into())),
-            Primitive::Function(f) => Cow::Owned(Primitive::Str(format!(
-                "function {f}() {{ [native code] }}"
-            ))),
+            JsValue::Object(_) => Cow::Owned(JsValue::Str("[object Object]".into())),
+            JsValue::Function(f) => Cow::Owned(JsValue::Str(
+                format!("function {f}() {{ [native code] }}").into(),
+            )),
             other => Cow::Borrowed(other),
         }
     }
@@ -274,16 +274,16 @@ impl Primitive {
     /// ToString.
     pub fn to_js_string(&self) -> Result<String, JSError> {
         Ok(match self {
-            Primitive::Number(n) => number_to_string(*n),
-            Primitive::BigInt(n) => n.to_string(),
-            Primitive::Str(s) => s.clone(),
-            Primitive::Bool(b) => b.to_string(),
-            Primitive::Null => "null".into(),
-            Primitive::Undefined => "undefined".into(),
-            Primitive::Symbol(_) => {
+            JsValue::Number(n) => number_to_string(*n),
+            JsValue::BigInt(n) => n.to_string(),
+            JsValue::Str(s) => s.to_string(),
+            JsValue::Bool(b) => b.to_string(),
+            JsValue::Null => "null".into(),
+            JsValue::Undefined => "undefined".into(),
+            JsValue::Symbol(_) => {
                 return Err(type_error("Cannot convert a Symbol value to a string"));
             }
-            Primitive::Object(_) | Primitive::Function(_) => {
+            JsValue::Object(_) | JsValue::Function(_) => {
                 return self.to_primitive().to_js_string();
             }
         })
@@ -292,14 +292,14 @@ impl Primitive {
     /// ToNumber.
     pub fn to_number(&self) -> Result<f64, JSError> {
         match self {
-            Primitive::Number(n) => Ok(*n),
-            Primitive::Str(s) => Ok(string_to_number(s)),
-            Primitive::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-            Primitive::Null => Ok(0.0),
-            Primitive::Undefined => Ok(f64::NAN),
-            Primitive::BigInt(_) => Err(type_error("Cannot convert a BigInt value to a number")),
-            Primitive::Symbol(_) => Err(type_error("Cannot convert a Symbol value to a number")),
-            Primitive::Object(_) | Primitive::Function(_) => self.to_primitive().to_number(),
+            JsValue::Number(n) => Ok(*n),
+            JsValue::Str(s) => Ok(string_to_number(s)),
+            JsValue::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+            JsValue::Null => Ok(0.0),
+            JsValue::Undefined => Ok(f64::NAN),
+            JsValue::BigInt(_) => Err(type_error("Cannot convert a BigInt value to a number")),
+            JsValue::Symbol(_) => Err(type_error("Cannot convert a Symbol value to a number")),
+            JsValue::Object(_) | JsValue::Function(_) => self.to_primitive().to_number(),
         }
     }
 
@@ -307,7 +307,7 @@ impl Primitive {
     /// ToNumber.
     fn to_numeric(&self) -> Result<Numeric, JSError> {
         match self {
-            Primitive::BigInt(n) => Ok(Numeric::BigInt(*n)),
+            JsValue::BigInt(n) => Ok(Numeric::BigInt(*n)),
             other => other.to_number().map(Numeric::Number),
         }
     }
@@ -316,32 +316,32 @@ impl Primitive {
 /// An arithmetic or bitwise operator: `number` when both sides are Numbers,
 /// `bigint` when both are BigInts, a TypeError for a mix.
 fn numeric_op(
-    lhs: &Primitive,
-    rhs: &Primitive,
+    lhs: &JsValue,
+    rhs: &JsValue,
     number: impl FnOnce(f64, f64) -> f64,
     bigint: impl FnOnce(i128, i128) -> Result<i128, JSError>,
-) -> Result<RcPrimitive, JSError> {
+) -> Result<JsValue, JSError> {
     match (lhs.to_numeric()?, rhs.to_numeric()?) {
-        (Numeric::Number(a), Numeric::Number(b)) => Ok(Primitive::Number(number(a, b)).into()),
-        (Numeric::BigInt(a), Numeric::BigInt(b)) => Ok(Primitive::BigInt(bigint(a, b)?).into()),
+        (Numeric::Number(a), Numeric::Number(b)) => Ok(JsValue::Number(number(a, b))),
+        (Numeric::BigInt(a), Numeric::BigInt(b)) => Ok(JsValue::BigInt(bigint(a, b)?)),
         _ => Err(mix_error()),
     }
 }
 
 /// IsLessThan: `None` when the comparison is undefined, i.e. a NaN is
 /// involved, which makes `<`, `>`, `<=` and `>=` all false.
-fn less_than(a: &Primitive, b: &Primitive) -> Result<Option<bool>, JSError> {
+fn less_than(a: &JsValue, b: &JsValue) -> Result<Option<bool>, JSError> {
     let (a, b) = (a.to_primitive(), b.to_primitive());
     match (a.as_ref(), b.as_ref()) {
         // Two strings compare by UTF-16 code units, not numerically:
         // "10" < "9".
-        (Primitive::Str(x), Primitive::Str(y)) => {
+        (JsValue::Str(x), JsValue::Str(y)) => {
             return Ok(Some(x.encode_utf16().lt(y.encode_utf16())));
         }
-        (Primitive::BigInt(x), Primitive::Str(y)) => {
+        (JsValue::BigInt(x), JsValue::Str(y)) => {
             return Ok(string_to_bigint(y).map(|y| *x < y));
         }
-        (Primitive::Str(x), Primitive::BigInt(y)) => {
+        (JsValue::Str(x), JsValue::BigInt(y)) => {
             return Ok(string_to_bigint(x).map(|x| x < *y));
         }
         _ => {}
@@ -356,11 +356,11 @@ fn less_than(a: &Primitive, b: &Primitive) -> Result<Option<bool>, JSError> {
 
 macro_rules! numeric_operator {
     ($trait:ident, $method:ident, $number:expr, $bigint:expr) => {
-        impl $trait for RcPrimitive {
-            type Output = Result<RcPrimitive, JSError>;
+        impl $trait for JsValue {
+            type Output = Result<JsValue, JSError>;
 
             fn $method(self, rhs: Self) -> Self::Output {
-                numeric_op(&self.0, &rhs.0, $number, $bigint)
+                numeric_op(&self, &rhs, $number, $bigint)
             }
         }
     };
@@ -412,22 +412,17 @@ numeric_operator!(
     |a: i128, b: i128| bigint_shl(a, b.checked_neg().unwrap_or(i128::MAX))
 );
 
-impl RcPrimitive {
-    #[allow(unused)]
-    pub(crate) fn undefined() -> Self {
-        Primitive::Undefined.into()
-    }
-
+impl JsValue {
     /// `self ** rhs`
     pub fn pow(&self, rhs: &Self) -> Result<Self, JSError> {
-        numeric_op(&self.0, &rhs.0, number_pow, bigint_pow)
+        numeric_op(self, rhs, number_pow, bigint_pow)
     }
 
     /// `self >>> rhs`: shifts in zeros, so the result is always non-negative.
     pub fn unsigned_shr(&self, rhs: &Self) -> Result<Self, JSError> {
         numeric_op(
-            &self.0,
-            &rhs.0,
+            self,
+            rhs,
             |a, b| (to_uint32(a) >> shift_count(b)) as f64,
             |_, _| {
                 Err(type_error(
@@ -439,38 +434,38 @@ impl RcPrimitive {
 
     /// `self < rhs`
     pub fn less_than(&self, rhs: &Self) -> Result<Self, JSError> {
-        Ok(less_than(&self.0, &rhs.0)?.unwrap_or(false).into())
+        Ok(less_than(self, rhs)?.unwrap_or(false).into())
     }
 
     /// `self > rhs`
     pub fn greater_than(&self, rhs: &Self) -> Result<Self, JSError> {
-        Ok(less_than(&rhs.0, &self.0)?.unwrap_or(false).into())
+        Ok(less_than(rhs, self)?.unwrap_or(false).into())
     }
 
     /// `self <= rhs`: not `rhs < self`, unless a NaN makes both false.
     pub fn less_eq(&self, rhs: &Self) -> Result<Self, JSError> {
-        Ok(less_than(&rhs.0, &self.0)?.is_some_and(|gt| !gt).into())
+        Ok(less_than(rhs, self)?.is_some_and(|gt| !gt).into())
     }
 
     /// `self >= rhs`
     pub fn greater_eq(&self, rhs: &Self) -> Result<Self, JSError> {
-        Ok(less_than(&self.0, &rhs.0)?.is_some_and(|lt| !lt).into())
+        Ok(less_than(self, rhs)?.is_some_and(|lt| !lt).into())
     }
 
     /// `self === rhs`: no type conversion. `NaN !== NaN`, `0 === -0`, and
     /// objects are equal only to themselves.
     pub fn strict_equals(&self, rhs: &Self) -> bool {
-        match (self.0.as_ref(), rhs.0.as_ref()) {
-            (Primitive::Number(a), Primitive::Number(b)) => a == b,
-            (Primitive::BigInt(a), Primitive::BigInt(b)) => a == b,
-            (Primitive::Str(a), Primitive::Str(b)) => a == b,
-            (Primitive::Bool(a), Primitive::Bool(b)) => a == b,
-            (Primitive::Symbol(a), Primitive::Symbol(b)) => a == b,
-            (Primitive::Null, Primitive::Null) | (Primitive::Undefined, Primitive::Undefined) => {
+        match (self, rhs) {
+            (JsValue::Number(a), JsValue::Number(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
+            (JsValue::Str(a), JsValue::Str(b)) => a == b,
+            (JsValue::Bool(a), JsValue::Bool(b)) => a == b,
+            (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
+            (JsValue::Null, JsValue::Null) | (JsValue::Undefined, JsValue::Undefined) => {
                 true
             }
-            (Primitive::Object(a), Primitive::Object(b)) => Rc::ptr_eq(a, b),
-            (Primitive::Function(f1), Primitive::Function(f2)) => f1 == f2,
+            (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
+            (JsValue::Function(f1), JsValue::Function(f2)) => f1 == f2,
             _ => false,
         }
     }
@@ -478,8 +473,8 @@ impl RcPrimitive {
     /// `self == rhs`: converts types first. `1 == "1"`, `0 == ""`,
     /// `null == undefined`, but `null != 0`.
     pub fn loose_equals(&self, rhs: &Self) -> bool {
-        use Primitive as P;
-        let (x, y) = (self.0.as_ref(), rhs.0.as_ref());
+        use JsValue as P;
+        let (x, y) = (self, rhs);
         if std::mem::discriminant(x) == std::mem::discriminant(y) {
             return self.strict_equals(rhs);
         }
@@ -490,14 +485,14 @@ impl RcPrimitive {
             (P::BigInt(n), P::Str(s)) | (P::Str(s), P::BigInt(n)) => {
                 string_to_bigint(s) == Some(*n)
             }
-            (P::Bool(b), _) => RcPrimitive::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
-            (_, P::Bool(b)) => self.loose_equals(&RcPrimitive::from(if *b { 1.0 } else { 0.0 })),
+            (P::Bool(b), _) => JsValue::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
+            (_, P::Bool(b)) => self.loose_equals(&JsValue::from(if *b { 1.0 } else { 0.0 })),
             (P::Object(_) | P::Function(_), P::Object(_) | P::Function(_)) => false,
             (P::Object(_) | P::Function(_), _) => {
-                RcPrimitive::from(x.to_primitive().into_owned()).loose_equals(rhs)
+                x.to_primitive().loose_equals(rhs)
             }
             (_, P::Object(_) | P::Function(_)) => {
-                self.loose_equals(&RcPrimitive::from(y.to_primitive().into_owned()))
+                self.loose_equals(&y.to_primitive())
             }
             (P::BigInt(a), P::Number(b)) | (P::Number(b), P::BigInt(a)) => {
                 bigint_cmp_number(*a, *b) == Some(Ordering::Equal)
@@ -508,31 +503,31 @@ impl RcPrimitive {
 
     /// `self && rhs`: `rhs` if `self` is truthy, else `self`.
     pub fn logical_and(self, rhs: Self) -> Self {
-        if self.0.to_boolean() { rhs } else { self }
+        if self.to_boolean() { rhs } else { self }
     }
 
     /// `self || rhs`: `self` if truthy, else `rhs`.
     pub fn logical_or(self, rhs: Self) -> Self {
-        if self.0.to_boolean() { self } else { rhs }
+        if self.to_boolean() { self } else { rhs }
     }
 
     /// `self ?? rhs`: `self` unless it's `null`/`undefined`.
     pub fn nullish_or(self, rhs: Self) -> Self {
-        if self.0.is_nullish() { rhs } else { self }
+        if self.is_nullish() { rhs } else { self }
     }
 
     /// `self in rhs`: whether the object `rhs` has a property named `self`.
     pub fn is_in(&self, rhs: &Self) -> Result<Self, JSError> {
-        let found = match rhs.0.as_ref() {
-            Primitive::Object(object) => match self.0.as_ref() {
+        let found = match rhs {
+            JsValue::Object(object) => match self {
                 // Properties are keyed by string; no object holds a symbol key.
-                Primitive::Symbol(_) => false,
+                JsValue::Symbol(_) => false,
                 key => object.has_prop(&key.to_js_string()?),
             },
             // Functions carry no properties in this VM.
-            Primitive::Function(_) => false,
+            JsValue::Function(_) => false,
             other => {
-                let key = self.0.to_js_string().unwrap_or_else(|_| "Symbol()".into());
+                let key = self.to_js_string().unwrap_or_else(|_| "Symbol()".into());
                 let target = other.to_js_string().unwrap_or_else(|_| "Symbol()".into());
                 return Err(type_error(format!(
                     "Cannot use 'in' operator to search for '{key}' in {target}"
@@ -544,11 +539,11 @@ impl RcPrimitive {
 
     /// `self instanceof rhs`.
     pub fn instance_of(&self, rhs: &Self) -> Result<Self, JSError> {
-        match rhs.0.as_ref() {
+        match rhs {
             // Objects have no prototype chain in this VM yet, so nothing is
             // an instance of a function. A primitive never is, in any VM.
-            Primitive::Function(_) => Ok(false.into()),
-            Primitive::Object(_) => Err(type_error(
+            JsValue::Function(_) => Ok(false.into()),
+            JsValue::Object(_) => Err(type_error(
                 "Right-hand side of 'instanceof' is not callable",
             )),
             _ => Err(type_error(

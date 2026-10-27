@@ -2,9 +2,9 @@ use std::{collections::HashMap, rc::Rc};
 
 use crate::{
     error::JSError,
-    executor::instr::Value,
+    executor::instr::Operand,
     primitive::{
-        Primitive, RcPrimitive,
+        JsValue,
         func::Func,
         objects::Object,
         proto::{Prototype, RcPrototype},
@@ -20,10 +20,10 @@ const ERROR: &str = "error";
 
 thread_local! {
     static CONSOLE_PROTO: RcPrototype =Prototype::create(HashMap::from([
-        (LOG.into(),RcPrimitive::from(Primitive::Function(LOG.into()))),
-        (WARN.into(),RcPrimitive::from(Primitive::Function(WARN.into()))),
-        (ERROR.into(),RcPrimitive::from(Primitive::Function(ERROR.into()))),
-        ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+        (LOG.into(),JsValue::Function(LOG.into())),
+        (WARN.into(),JsValue::Function(WARN.into())),
+        (ERROR.into(),JsValue::Function(ERROR.into())),
+        ("prototype".into(),JsValue::Undefined)
     ]),None).into();
 }
 
@@ -55,7 +55,7 @@ impl Object for Console {
         todo!()
     }
 
-    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError> {
+    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError> {
         self.prototype().0.borrow().get(prop)
     }
 
@@ -64,7 +64,7 @@ impl Object for Console {
         engine: &mut crate::executor::engine::JSEngine,
         scope: &Rc<crate::executor::scope::Scope>,
         method: &Func,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError> {
         let pref = match method.as_ref() {
             "log" => "",
@@ -97,12 +97,12 @@ mod tests {
         let mut engine = JSEngine::new();
         let scope = engine.scope.clone();
         let var = scope.get_variable("console").unwrap();
-        if let Primitive::Object(ob) = var.as_ref() {
+        if let JsValue::Object(ob) = &var {
             ob.call(
                 &mut engine,
                 &scope,
                 &Func("warn".into()),
-                &[RcPrimitive::from("testing").into()],
+                &[JsValue::from("testing").into()],
             )
             .unwrap();
         }

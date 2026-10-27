@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use crate::{executor::instr::Value, primitive::RcPrimitive};
+use crate::{executor::instr::Operand, primitive::JsValue};
 
 #[derive(Debug, Clone)]
 pub enum StackValue {
     Number(isize),
-    Value(Value),
+    Value(Operand),
 }
 
 /// Values pushed for later use (e.g. array elements). Holds resolved values,
@@ -13,19 +13,19 @@ pub enum StackValue {
 /// value is popped.
 #[derive(Debug, Clone, Default)]
 pub struct JSStack {
-    stack: VecDeque<RcPrimitive>,
+    stack: VecDeque<JsValue>,
 }
 
 impl JSStack {
-    pub fn push(&mut self, value: RcPrimitive) {
+    pub fn push(&mut self, value: JsValue) {
         self.stack.push_back(value);
     }
 
-    pub fn pop(&mut self) -> Option<RcPrimitive> {
+    pub fn pop(&mut self) -> Option<JsValue> {
         self.stack.pop_back()
     }
 
-    pub fn peek(&mut self) -> Option<&RcPrimitive> {
+    pub fn peek(&mut self) -> Option<&JsValue> {
         self.stack.back()
     }
 }

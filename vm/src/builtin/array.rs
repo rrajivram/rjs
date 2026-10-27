@@ -8,11 +8,11 @@ use crate::{
     error::JSError,
     executor::{
         engine::{JSEngine, Register},
-        instr::Value,
+        instr::Operand,
         scope::Scope,
     },
     primitive::{
-        Primitive, RcPrimitive,
+        JsValue,
         func::Func,
         objects::{Object, ObjectPrimitive},
         proto::{Prototype, RcPrototype},
@@ -76,8 +76,8 @@ thread_local! {
             .iter()
             .chain(CALLBACK_METHODS)
             .chain(ITERATOR_METHODS)
-            .map(|m| (m.to_string(), RcPrimitive::from(Primitive::Function((*m).into()))))
-            .chain([("prototype".to_string(), RcPrimitive::from(Primitive::Undefined))])
+            .map(|m| (m.to_string(), JsValue::Function((*m).into())))
+            .chain([("prototype".to_string(), JsValue::Undefined)])
             .collect::<HashMap<_, _>>(),
         Some(ObjectPrimitive::defaul_prototype()),
     )
@@ -90,7 +90,7 @@ thread_local! {
 
 #[derive(Debug, Clone, Default)]
 pub struct Array {
-    items: RefCell<Vec<RcPrimitive>>,
+    items: RefCell<Vec<JsValue>>,
     /// The `Rc` this array lives in, so methods like `reverse` can return
     /// the array itself. Empty for arrays not built with [`Array::create`].
     this: Weak<Array>,
@@ -101,7 +101,7 @@ impl Array {
         Self::default()
     }
 
-    pub fn with(items: &[RcPrimitive]) -> Self {
+    pub fn with(items: &[JsValue]) -> Self {
         Self {
             items: RefCell::from(items.to_vec()),
             this: Weak::new(),
@@ -109,12 +109,12 @@ impl Array {
     }
 
     /// A new array value.
-    pub fn create(items: Vec<RcPrimitive>) -> RcPrimitive {
+    pub fn create(items: Vec<JsValue>) -> JsValue {
         let array = Rc::new_cyclic(|this| Self {
             items: RefCell::new(items),
             this: this.clone(),
         });
-        Primitive::Object(array).into()
+        JsValue::Object(array)
     }
 
     pub fn len(&self) -> usize {
@@ -125,15 +125,15 @@ impl Array {
         self.len() == 0
     }
 
-    pub fn items(&self) -> Vec<RcPrimitive> {
+    pub fn items(&self) -> Vec<JsValue> {
         self.items.borrow().clone()
     }
 
     /// The array as a value, for methods that return `this`.
-    fn this(&self) -> Result<RcPrimitive, JSError> {
+    fn this(&self) -> Result<JsValue, JSError> {
         self.this
             .upgrade()
-            .map(|array| Primitive::Object(array).into())
+            .map(|array| JsValue::Object(array))
             .ok_or_else(|| JSError::UnknownError("array has no reference to itself".into()))
     }
 
@@ -142,9 +142,9 @@ impl Array {
         func: &Func,
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError> {
-        let name = func.0.as_str();
+        let name = func.as_ref();
         if name == "new" {
             return self.do_new(engine, scope, args);
         }
@@ -175,7 +175,7 @@ impl Array {
             "indexOf" => self.do_index_of(&args),
             "join" => self.do_join(&args),
             "lastIndexOf" => self.do_last_index_of(&args),
-            "pop" => Ok(self.items.borrow_mut().pop().unwrap_or_else(RcPrimitive::undefined)),
+            "pop" => Ok(self.items.borrow_mut().pop().unwrap_or(JsValue::Undefined)),
             "push" => self.do_push(args),
             "reverse" => {
                 self.items.borrow_mut().reverse();
@@ -215,13 +215,12 @@ impl Array {
         &self,
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError> {
         let count = match args.len() {
             0 => 0,
             1 => engine
                 .resolve_value(&args[0], scope)?
-                .as_ref()
                 .to_number()? as usize,
             _ => {
                 return Err(JSError::UnknownError(format!(
@@ -244,14 +243,14 @@ impl Array {
         Ok(())
     }
 
-    fn do_is_array(args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_is_array(args: &[JsValue]) -> Result<JsValue, JSError> {
         Ok(as_array(&arg(args, 0)).is_some().into())
     }
 
     /// `Array.from(arrayOrString)`: a copy of an array, or a string's
     /// characters.
-    fn do_from(args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
-        if !matches!(arg(args, 1).as_ref(), Primitive::Undefined) {
+    fn do_from(args: &[JsValue]) -> Result<JsValue, JSError> {
+        if !matches!(&arg(args, 1), JsValue::Undefined) {
             return Err(JSError::NotSupported(
                 "Array.from with a map function needs a callback, and the VM can't call JS functions yet"
                     .into(),
@@ -261,31 +260,31 @@ impl Array {
         if let Some(array) = as_array(&source) {
             return Ok(Self::create(array.items()));
         }
-        match source.as_ref() {
-            Primitive::Str(s) => Ok(Self::create(
-                s.chars().map(|c| RcPrimitive::from(c.to_string())).collect(),
+        match &source {
+            JsValue::Str(s) => Ok(Self::create(
+                s.chars().map(|c| JsValue::from(c.to_string())).collect(),
             )),
-            Primitive::Null | Primitive::Undefined => Err(JSError::TypeError(format!(
+            JsValue::Null | JsValue::Undefined => Err(JSError::TypeError(format!(
                 "{} is not iterable",
-                source.as_ref().to_js_string()?
+                source.to_js_string()?
             ))),
             // Non-iterable values have no elements.
             _ => Ok(Self::create(vec![])),
         }
     }
 
-    fn do_at(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_at(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let len = self.len() as f64;
         let n = to_integer(&arg(args, 0))?;
         let k = if n < 0.0 { len + n } else { n };
         Ok(if k < 0.0 || k >= len {
-            RcPrimitive::undefined()
+            JsValue::Undefined
         } else {
             self.items.borrow()[k as usize].clone()
         })
     }
 
-    fn do_concat(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_concat(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let mut items = self.items();
         for a in args {
             match as_array(a) {
@@ -298,7 +297,7 @@ impl Array {
 
     /// `copyWithin(target, start, end)`: copies `start..end` over the
     /// elements from `target`, without changing the length.
-    fn do_copy_within(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_copy_within(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let len = self.len();
         let target = relative_index(&arg(args, 0), len, 0)?;
         let start = relative_index(&arg(args, 1), len, 0)?;
@@ -316,7 +315,7 @@ impl Array {
         self.this()
     }
 
-    fn do_fill(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_fill(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let len = self.len();
         let value = arg(args, 0);
         let start = relative_index(&arg(args, 1), len, 0)?;
@@ -328,9 +327,9 @@ impl Array {
     }
 
     /// `flat(depth = 1)`: nested arrays up to `depth` levels are spliced in.
-    fn do_flat(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
-        let depth = match arg(args, 0).as_ref() {
-            Primitive::Undefined => 1.0,
+    fn do_flat(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
+        let depth = match &arg(args, 0) {
+            JsValue::Undefined => 1.0,
             _ => to_integer(&arg(args, 0))?,
         };
         let mut out = vec![];
@@ -339,14 +338,14 @@ impl Array {
     }
 
     /// `includes(value, from)`: SameValueZero, so `NaN` finds `NaN`.
-    fn do_includes(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_includes(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let target = arg(args, 0);
         let from = relative_index(&arg(args, 1), self.len(), 0)?;
         Ok(self.items.borrow()[from..].contains(&target).into())
     }
 
     /// `indexOf(value, from)`: strict equality, so `NaN` is never found.
-    fn do_index_of(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_index_of(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let target = arg(args, 0);
         let from = relative_index(&arg(args, 1), self.len(), 0)?;
         let found = self.items.borrow()[from..]
@@ -358,7 +357,7 @@ impl Array {
 
     /// `lastIndexOf(value, from)`: searches backwards from `from`, which
     /// defaults to the last element.
-    fn do_last_index_of(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_last_index_of(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let target = arg(args, 0);
         let len = self.len() as f64;
         let last = if args.len() < 2 {
@@ -376,9 +375,9 @@ impl Array {
         Ok(index_result(found))
     }
 
-    fn do_join(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
-        let separator = match arg(args, 0).as_ref() {
-            Primitive::Undefined => ",".to_string(),
+    fn do_join(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
+        let separator = match &arg(args, 0) {
+            JsValue::Undefined => ",".to_string(),
             sep => sep.to_js_string()?,
         };
         Ok(self.join_with(&separator)?.into())
@@ -395,8 +394,8 @@ impl Array {
         let result = self
             .items()
             .iter()
-            .map(|v| match v.as_ref() {
-                Primitive::Null | Primitive::Undefined => Ok(String::new()),
+            .map(|v| match v {
+                JsValue::Null | JsValue::Undefined => Ok(String::new()),
                 _ => to_string_value(v),
             })
             .collect::<Result<Vec<_>, _>>()
@@ -405,22 +404,22 @@ impl Array {
         result
     }
 
-    fn do_push(&self, args: Vec<RcPrimitive>) -> Result<RcPrimitive, JSError> {
+    fn do_push(&self, args: Vec<JsValue>) -> Result<JsValue, JSError> {
         let mut items = self.items.borrow_mut();
         items.extend(args);
         Ok((items.len() as f64).into())
     }
 
-    fn do_shift(&self) -> Result<RcPrimitive, JSError> {
+    fn do_shift(&self) -> Result<JsValue, JSError> {
         let mut items = self.items.borrow_mut();
         Ok(if items.is_empty() {
-            RcPrimitive::undefined()
+            JsValue::Undefined
         } else {
             items.remove(0)
         })
     }
 
-    fn do_slice(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_slice(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let len = self.len();
         let start = relative_index(&arg(args, 0), len, 0)?;
         let end = relative_index(&arg(args, 1), len, len)?;
@@ -433,19 +432,19 @@ impl Array {
     }
 
     /// `splice(start, deleteCount, ...items)`: returns the removed elements.
-    fn do_splice(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_splice(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let removed = splice_items(&mut self.items.borrow_mut(), args)?;
         Ok(Self::create(removed))
     }
 
-    fn do_unshift(&self, args: Vec<RcPrimitive>) -> Result<RcPrimitive, JSError> {
+    fn do_unshift(&self, args: Vec<JsValue>) -> Result<JsValue, JSError> {
         let mut items = self.items.borrow_mut();
         items.splice(0..0, args);
         Ok((items.len() as f64).into())
     }
 
     /// `with(index, value)`: a copy with one element replaced.
-    fn do_with(&self, args: &[RcPrimitive]) -> Result<RcPrimitive, JSError> {
+    fn do_with(&self, args: &[JsValue]) -> Result<JsValue, JSError> {
         let len = self.len() as f64;
         let n = to_integer(&arg(args, 0))?;
         let k = if n < 0.0 { len + n } else { n };
@@ -458,41 +457,41 @@ impl Array {
     }
 
     /// Sets `length`: truncates, or pads with `undefined`.
-    fn set_length(&self, value: &RcPrimitive) -> Result<(), JSError> {
-        let n = value.as_ref().to_number()?;
+    fn set_length(&self, value: &JsValue) -> Result<(), JSError> {
+        let n = value.to_number()?;
         if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
             return Err(JSError::RangeError("Invalid array length".into()));
         }
         self.items
             .borrow_mut()
-            .resize(n as usize, RcPrimitive::undefined());
+            .resize(n as usize, JsValue::Undefined);
         Ok(())
     }
 }
 
 /// The `i`th argument, or `undefined` if it wasn't passed.
-fn arg(args: &[RcPrimitive], i: usize) -> RcPrimitive {
-    args.get(i).cloned().unwrap_or_else(RcPrimitive::undefined)
+fn arg(args: &[JsValue], i: usize) -> JsValue {
+    args.get(i).cloned().unwrap_or(JsValue::Undefined)
 }
 
 /// The array inside a value, if it is one.
-fn as_array(value: &RcPrimitive) -> Option<&Array> {
-    match value.as_ref() {
-        Primitive::Object(object) => object.as_array(),
+fn as_array(value: &JsValue) -> Option<&Array> {
+    match value {
+        JsValue::Object(object) => object.as_array(),
         _ => None,
     }
 }
 
 /// ToIntegerOrInfinity: truncates toward zero; `NaN` is 0.
-fn to_integer(value: &RcPrimitive) -> Result<f64, JSError> {
-    let n = value.as_ref().to_number()?;
+fn to_integer(value: &JsValue) -> Result<f64, JSError> {
+    let n = value.to_number()?;
     Ok(if n.is_nan() { 0.0 } else { n.trunc() })
 }
 
 /// A position argument where negative values count back from the end,
 /// clamped to `0..=len`. `undefined` means `default`.
-fn relative_index(value: &RcPrimitive, len: usize, default: usize) -> Result<usize, JSError> {
-    if matches!(value.as_ref(), Primitive::Undefined) {
+fn relative_index(value: &JsValue, len: usize, default: usize) -> Result<usize, JSError> {
+    if matches!(value, JsValue::Undefined) {
         return Ok(default);
     }
     let n = to_integer(value)?;
@@ -500,20 +499,20 @@ fn relative_index(value: &RcPrimitive, len: usize, default: usize) -> Result<usi
     Ok(if n < 0.0 { (len + n).max(0.0) } else { n.min(len) } as usize)
 }
 
-fn index_result(index: Option<usize>) -> RcPrimitive {
+fn index_result(index: Option<usize>) -> JsValue {
     index.map_or(-1.0, |i| i as f64).into()
 }
 
 /// ToString, except that arrays join their elements (`[1, [2, 3]]` is
 /// `"1,2,3"`) rather than becoming `"[object Object]"`.
-fn to_string_value(value: &RcPrimitive) -> Result<String, JSError> {
+fn to_string_value(value: &JsValue) -> Result<String, JSError> {
     match as_array(value) {
         Some(array) => array.join_with(","),
-        None => value.as_ref().to_js_string(),
+        None => value.to_js_string(),
     }
 }
 
-fn flatten_into(items: &[RcPrimitive], depth: f64, out: &mut Vec<RcPrimitive>) {
+fn flatten_into(items: &[JsValue], depth: f64, out: &mut Vec<JsValue>) {
     for item in items {
         match as_array(item) {
             Some(nested) if depth >= 1.0 => flatten_into(&nested.items(), depth - 1.0, out),
@@ -524,10 +523,10 @@ fn flatten_into(items: &[RcPrimitive], depth: f64, out: &mut Vec<RcPrimitive>) {
 
 /// The default sort: by string form, compared as UTF-16 code units, with
 /// `undefined` last. Stable, like JS's. Comparator functions need callbacks.
-fn sort_items(items: Vec<RcPrimitive>, args: &[RcPrimitive]) -> Result<Vec<RcPrimitive>, JSError> {
-    match arg(args, 0).as_ref() {
-        Primitive::Undefined => {}
-        Primitive::Function(_) => {
+fn sort_items(items: Vec<JsValue>, args: &[JsValue]) -> Result<Vec<JsValue>, JSError> {
+    match &arg(args, 0) {
+        JsValue::Undefined => {}
+        JsValue::Function(_) => {
             return Err(JSError::NotSupported(
                 "sorting with a comparator needs a callback, and the VM can't call JS functions yet"
                     .into(),
@@ -541,7 +540,7 @@ fn sort_items(items: Vec<RcPrimitive>, args: &[RcPrimitive]) -> Result<Vec<RcPri
     }
     let (undefined, defined): (Vec<_>, Vec<_>) = items
         .into_iter()
-        .partition(|v| matches!(v.as_ref(), Primitive::Undefined));
+        .partition(|v| matches!(v, JsValue::Undefined));
     let mut keyed = defined
         .into_iter()
         .map(|v| Ok((to_string_value(&v)?.encode_utf16().collect::<Vec<_>>(), v)))
@@ -553,9 +552,9 @@ fn sort_items(items: Vec<RcPrimitive>, args: &[RcPrimitive]) -> Result<Vec<RcPri
 /// Splices `items` in place per `splice(start, deleteCount, ...insert)`,
 /// returning the removed elements.
 fn splice_items(
-    items: &mut Vec<RcPrimitive>,
-    args: &[RcPrimitive],
-) -> Result<Vec<RcPrimitive>, JSError> {
+    items: &mut Vec<JsValue>,
+    args: &[JsValue],
+) -> Result<Vec<JsValue>, JSError> {
     let len = items.len();
     let start = relative_index(&arg(args, 0), len, 0)?;
     let delete = match args.len() {
@@ -599,7 +598,7 @@ impl Object for Array {
             .collect()
     }
 
-    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError> {
+    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError> {
         if prop == "length" {
             return Ok((self.len() as f64).into());
         }
@@ -609,19 +608,19 @@ impl Object for Array {
                 .borrow()
                 .get(i)
                 .cloned()
-                .unwrap_or_else(RcPrimitive::undefined));
+                .unwrap_or(JsValue::Undefined));
         }
         self.prototype().0.borrow().get(prop)
     }
 
-    fn set_prop(&self, prop: &str, value: RcPrimitive) -> Result<(), JSError> {
+    fn set_prop(&self, prop: &str, value: JsValue) -> Result<(), JSError> {
         if prop == "length" {
             return self.set_length(&value);
         }
         if let Some(i) = array_index(prop) {
             let mut items = self.items.borrow_mut();
             if i >= items.len() {
-                items.resize(i + 1, RcPrimitive::undefined());
+                items.resize(i + 1, JsValue::Undefined);
             }
             items[i] = value;
             return Ok(());
@@ -642,7 +641,7 @@ impl Object for Array {
             .0
             .borrow()
             .get(method)
-            .is_ok_and(|m| matches!(m.as_ref(), Primitive::Function(_)))
+            .is_ok_and(|m| matches!(&m, JsValue::Function(_)))
     }
 
     fn call(
@@ -650,12 +649,12 @@ impl Object for Array {
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
         method: &Func,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError> {
-        if let Primitive::Function(func) = self.get_prop(&method.0)?.as_ref() {
+        if let JsValue::Function(func) = &self.get_prop(&method.0)? {
             self.call_func(func, engine, scope, args)
         } else {
-            Err(JSError::RefereneError(method.0.clone()))
+            Err(JSError::RefereneError(method.to_string()))
         }
     }
 
@@ -670,7 +669,7 @@ mod tests {
     use crate::{
         error::JSError,
         executor::engine::JSEngine,
-        primitive::{Primitive, RcPrimitive},
+        primitive::{JsValue},
     };
 
     /// Run `src` and return variable `s` as a string.
@@ -848,15 +847,15 @@ mod tests {
     #[test]
     fn test_index_and_length_properties() {
         let array = Array::create(vec![1.0.into(), 2.0.into(), 3.0.into()]);
-        let Primitive::Object(object) = array.as_ref() else {
+        let JsValue::Object(object) = &array else {
             unreachable!()
         };
         assert_eq!(object.get_prop("1").unwrap(), 2.0.into());
-        assert_eq!(object.get_prop("7").unwrap(), RcPrimitive::undefined());
+        assert_eq!(object.get_prop("7").unwrap(), JsValue::Undefined);
         assert!(object.has_prop("2") && !object.has_prop("3") && object.has_prop("push"));
         object.set_prop("4", "x".into()).unwrap();
         assert_eq!(object.get_prop("length").unwrap(), 5.0.into());
-        assert_eq!(object.get_prop("3").unwrap(), RcPrimitive::undefined(), "the gap is filled");
+        assert_eq!(object.get_prop("3").unwrap(), JsValue::Undefined, "the gap is filled");
         object.set_prop("length", 2.0.into()).unwrap();
         assert_eq!(object.as_array().unwrap().join_with(",").unwrap(), "1,2");
         assert!(matches!(

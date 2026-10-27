@@ -16,18 +16,18 @@ use crate::{
     error::JSError,
     executor::{
         instr::{
-            Binary, Call, Declare, GetAttr, Hoist, Init, Instruction, Jump, JumpIf, JumpPos, Push,
-            Set, Value,
+            Binary, Call, Declare, GetAttr, Hoist, Init, Instruction, Jump, JumpIf, JumpPos,
+            Operand, Push, Set,
         },
         scope::{Scope, VariableType},
     },
-    primitive::{Primitive, RcPrimitive, jstack::JSStack},
+    primitive::{JsValue, jstack::JSStack},
 };
 
 #[derive(Debug, Clone)]
 pub enum InstructionType {
     Instruction(Vec<LabelledInstruction>),
-    Value(Value),
+    Value(Operand),
 }
 
 #[derive(Debug, Clone)]
@@ -47,49 +47,74 @@ pub enum Register {
 #[derive(Clone)]
 pub struct JSEngine {
     pub scope: Rc<Scope>,
-    pub registers: HashMap<Register, RcPrimitive>,
+    pub registers: HashMap<Register, JsValue>,
     pub stack: JSStack,
-    pub labels: HashMap<String, Option<usize>>,
-    /// Counter for compiler temporaries (`__t0`, `__t1`, ...).
+    /// Counter for jump labels during compilation (`__L0`, `__L1`, ...).
+    labels: usize,
+    /// Counter for compiler temporaries (`__t0`, `__t1`, ...). Restarts at
+    /// each statement, since a temporary never outlives its statement.
     temps: usize,
+    /// Print the parsed program, diagnostics and emitter tracing. Off for
+    /// runs that should only show what the program itself logs.
+    pub verbose: bool,
 }
 
 #[allow(clippy::new_without_default)]
 impl JSEngine {
     pub fn new() -> Self {
         let registers = HashMap::from([
-            (Register::AX, Primitive::Undefined.into()),
-            (Register::BX, Primitive::Undefined.into()),
-            (Register::CX, Primitive::Undefined.into()),
-            (Register::DX, Primitive::Undefined.into()),
+            (Register::AX, JsValue::Undefined),
+            (Register::BX, JsValue::Undefined),
+            (Register::CX, JsValue::Undefined),
+            (Register::DX, JsValue::Undefined),
         ]);
         Self {
             scope: Scope::create_default(),
             registers,
             stack: JSStack::default(),
-            labels: HashMap::new(),
+            labels: 0,
             temps: 0,
+            verbose: true,
         }
     }
 
+    /// Parse, compile and run `src`.
     pub fn exec(&mut self, src: &str) -> Result<(), JSError> {
+        let program = self.parse(src)?;
+        let instrs = self.compile(&program)?;
+        self.run(&instrs)
+    }
+
+    /// Parse and validate `src`.
+    pub fn parse(&self, src: &str) -> Result<Vec<Statement>, JSError> {
         let res = run_parser(src);
         if !res.errors.is_empty() {
             return Err(JSError::BadJavascript(res.errors));
         }
-        for s in &res.program {
-            println!("{}", s);
+        if self.verbose {
+            for s in &res.program {
+                println!("{}", s);
+            }
+            for s in res.diagnostics {
+                println!("Warning: {}", s);
+            }
         }
-        for s in res.diagnostics {
-            println!("Warning: {}", s);
-        }
+        Ok(res.program)
+    }
+
+    /// Compile a parsed program to instructions. Jumps are resolved to
+    /// instruction positions, so the result doesn't depend on this engine.
+    pub fn compile(&mut self, program: &[Statement]) -> Result<Vec<Instruction>, JSError> {
+        link(self.emit_code(program)?)
+    }
+
+    /// Run compiled instructions in the engine's global scope.
+    pub fn run(&mut self, instrs: &[Instruction]) -> Result<(), JSError> {
         let mut top_scope = self.scope.clone();
         let mut scopes = VecDeque::new();
-        let instrs = self.emit_code(&res.program)?;
-
         let mut pc = 0;
         while pc < instrs.len() {
-            let instr = instrs[pc].as_ref();
+            let instr = &instrs[pc];
             if matches!(instr, Instruction::BeginScope) {
                 scopes.push_back(top_scope.clone());
                 top_scope = Scope::create(top_scope.clone());
@@ -103,15 +128,12 @@ impl JSEngine {
                 pc += 1;
                 continue;
             }
-            pc = match instrs[pc].as_ref().exec(self, &top_scope)? {
+            pc = match instr.exec(self, &top_scope)? {
                 None => pc + 1,
-                Some(JumpPos::Label(l)) => self
-                    .labels
-                    .get(&l)
-                    .copied()
-                    .flatten()
-                    .ok_or(JSError::UnknownError(format!(" Uknown label : {l}")))?,
                 Some(JumpPos::Global(g)) => g,
+                Some(JumpPos::Label(l)) => {
+                    return Err(JSError::UnknownError(format!("unlinked label {l}")));
+                }
                 Some(JumpPos::Relative(r)) => (pc as isize + r) as usize,
             };
         }
@@ -119,37 +141,20 @@ impl JSEngine {
     }
 
     fn emit_code(&mut self, stmts: &[Statement]) -> Result<Vec<LabelledInstruction>, JSError> {
-        self.labels.clear();
-        self.temps = 0;
+        self.labels = 0;
         let mut instrs = hoist_declarations(stmts, true);
         for st in stmts {
             instrs.extend(self.emit_statement(st)?);
         }
-        self.build_labels_map(&instrs)?;
-        if self.labels.values().any(|v| v.is_none()) {
-            return Err(JSError::UnknownError(
-                "Some labels don't have values".into(),
-            ));
-        }
         Ok(instrs)
     }
 
-    fn build_labels_map(&mut self, ins: &[LabelledInstruction]) -> Result<(), JSError> {
-        for (index, i) in ins.iter().enumerate() {
-            if let Some(label) = &i.label {
-                if let Some(instr) = self.labels.get_mut(label) {
-                    *instr = Some(index);
-                } else {
-                    return Err(JSError::UnknownError(format!(
-                        "Could not find label {label}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn emit_statement(&mut self, st: &Statement) -> Result<Vec<LabelledInstruction>, JSError> {
+        // Temporaries hold values only within one statement, so each
+        // statement can reuse the same few names. Nested statements (an if's
+        // branches) start after the enclosing statement's temporaries are
+        // no longer needed.
+        self.temps = 0;
         match st {
             Statement::VarDecl(v) => Ok(self.emit_vardecl(v)?),
             Statement::Expr(ex) => {
@@ -168,8 +173,112 @@ impl JSEngine {
                 then,
                 otherwise,
             } => Ok(self.emit_if(test, then, otherwise)?),
+            Statement::For {
+                init,
+                test,
+                update,
+                body,
+            } => Ok(self.emit_for(init, test, update, body)?),
             _ => todo!(),
         }
+    }
+
+    fn emit_for(
+        &mut self,
+        init: &Option<ForInit>,
+        test: &Option<Expr>,
+        update: &Option<Expr>,
+        body: &Statement,
+    ) -> Result<Vec<LabelledInstruction>, JSError> {
+        let mut ins = vec![Instruction::BeginScope.into()];
+        if let Some(ForInit::VarDecl(v)) = init {
+            ins.extend(hoist_declarations(&[Statement::VarDecl(v.clone())], false));
+        }
+        let init = init
+            .clone()
+            .map(|i| match &i {
+                ForInit::Expr(e) => self.emit_exprs(e, None),
+                ForInit::VarDecl(v) => self.emit_vardecl_expr(v),
+            })
+            .transpose()?;
+        let test = test
+            .clone()
+            .map(|t| self.emit_exprs(&t, None))
+            .transpose()?;
+        let update = update
+            .clone()
+            .map(|u| self.emit_exprs(&u, None))
+            .transpose()?;
+        let statement = self.emit_statement(body)?;
+        if let Some(init) = init {
+            ins.extend(self.extract_instructions(init, None));
+        }
+        let test_ok = self.new_label();
+        let test_start = self.new_label();
+        let end_label = self.new_label();
+        ins.push(LabelledInstruction {
+            label: Some(test_start.clone()),
+            instruction: Instruction::Noop,
+        });
+        if let Some(test) = test {
+            ins.extend(self.extract_instructions(test, None));
+            ins.push(
+                Instruction::JumpIf(JumpIf {
+                    if_true: true,
+                    value: Operand::Register(Register::AX),
+                    pos: JumpPos::Label(test_ok.clone()),
+                })
+                .into(),
+            );
+            ins.push(
+                Instruction::Jump(Jump {
+                    pos: JumpPos::Label(end_label.clone()),
+                })
+                .into(),
+            );
+        }
+        ins.push(LabelledInstruction {
+            label: Some(test_ok),
+            instruction: Instruction::Noop,
+        });
+        ins.extend(statement);
+        if let Some(update) = update {
+            ins.extend(self.extract_instructions(update, None));
+        }
+        ins.push(
+            Instruction::Jump(Jump {
+                pos: JumpPos::Label(test_start),
+            })
+            .into(),
+        );
+        ins.push(LabelledInstruction {
+            label: Some(end_label),
+            instruction: Instruction::Noop,
+        });
+        ins.push(Instruction::EndScope.into());
+
+        Ok(ins)
+    }
+
+    fn extract_instructions(
+        &self,
+        ins: InstructionType,
+        output: Option<Operand>,
+    ) -> Vec<LabelledInstruction> {
+        let mut res = vec![];
+        match ins {
+            InstructionType::Instruction(ins) => {
+                res.extend(ins);
+            }
+            InstructionType::Value(v) => {
+                if let Some(output) = output {
+                    res.push(self.set_instr(output, v).into())
+                } else {
+                    res.push(self.set_instr(Operand::Register(Register::AX), v).into())
+                }
+            }
+        }
+        res
     }
 
     /// The name is already hoisted to the start of its scope, so a declaration
@@ -183,12 +292,12 @@ impl JSEngine {
                     let value = match &d.init {
                         // `var x;` leaves an existing value alone.
                         None if is_var => continue,
-                        None => Primitive::Undefined.into(),
+                        None => JsValue::Undefined.into(),
                         Some(ex) => match self.emit_exprs(ex, None)? {
                             InstructionType::Value(v) => v,
                             InstructionType::Instruction(ins) => {
                                 instrs.extend(ins);
-                                Value::Register(Register::AX)
+                                Operand::Register(Register::AX)
                             }
                         },
                     };
@@ -206,19 +315,25 @@ impl JSEngine {
         Ok(instrs)
     }
 
+    fn emit_vardecl_expr(&mut self, decl: &VarDecl) -> Result<InstructionType, JSError> {
+        Ok(InstructionType::Instruction(self.emit_vardecl(decl)?))
+    }
+
     #[allow(unused)]
     fn emit_exprs(
         &mut self,
         ex: &Expr,
         output: Option<Register>,
     ) -> Result<InstructionType, JSError> {
-        println!("In Exprs: {:?}", ex);
+        if self.verbose {
+            println!("In Exprs: {:?}", ex);
+        }
         match ex {
             Expr::Literal(literal) => Ok(InstructionType::Value(literal.into())),
-            Expr::Ident(ident) => Ok(InstructionType::Value(Value::Var(ident.value.clone()))),
+            Expr::Ident(ident) => Ok(InstructionType::Value(Operand::Var(ident.value.clone()))),
             Expr::This(_token_span) => todo!(),
             Expr::Super(_token_span) => todo!(),
-            Expr::Array(exprs) => Ok(self.emit_array(exprs)?),
+            Expr::Array(exprs) => Ok(self.emit_array_expr(exprs)?),
             Expr::Object(_items) => todo!(),
             Expr::Function(_function) => todo!(),
             Expr::Arrow(_arrow) => todo!(),
@@ -227,19 +342,19 @@ impl JSEngine {
             Expr::Spread(_expr) => todo!(),
             Expr::Unary { op, value } => todo!(),
             Expr::Update { op, prefix, target } => todo!(),
-            Expr::Binary { left, op, right } => Ok(self.emit_binary(left, op, right, output)?),
+            Expr::Binary { left, op, right } => Ok(self.emit_binary_expr(left, op, right, output)?),
             Expr::Conditional {
                 test,
                 then,
                 otherwise,
-            } => Ok(self.emit_conditional(test, then, otherwise)?),
-            Expr::Assign { target, op, value } => Ok(self.emit_assign(target, op, value)?),
+            } => Ok(self.emit_conditional_expr(test, then, otherwise)?),
+            Expr::Assign { target, op, value } => Ok(self.emit_assign_expr(target, op, value)?),
             Expr::Sequence(exprs) => todo!(),
             Expr::Member {
                 object,
                 property,
                 optional,
-            } => Ok(self.emit_member(object, property, *optional)?),
+            } => Ok(self.emit_member_expr(object, property, *optional)?),
             Expr::Index {
                 object,
                 index,
@@ -259,7 +374,7 @@ impl JSEngine {
         }
     }
 
-    fn emit_array(&mut self, array: &[Option<Expr>]) -> Result<InstructionType, JSError> {
+    fn emit_array_expr(&mut self, array: &[Option<Expr>]) -> Result<InstructionType, JSError> {
         let mut instr = vec![];
         for a in array {
             if let Some(val) = a {
@@ -269,7 +384,7 @@ impl JSEngine {
                         instr.extend(i);
                         instr.push(
                             Instruction::Push(super::instr::Push {
-                                value: Value::Register(Register::AX),
+                                value: Operand::Register(Register::AX),
                             })
                             .into(),
                         );
@@ -281,7 +396,7 @@ impl JSEngine {
             } else {
                 instr.push(
                     Instruction::Push(Push {
-                        value: Value::Primitive(Primitive::Null.into()),
+                        value: Operand::Value(JsValue::Null),
                     })
                     .into(),
                 );
@@ -289,17 +404,17 @@ impl JSEngine {
         }
         instr.push(
             Instruction::GetAttr(GetAttr {
-                object: Value::Var("Array".into()),
+                object: Operand::Var("Array".into()),
                 attrib: "new".into(),
-                output: Value::Register(Register::AX),
-                obj_output: Value::Register(Register::BX),
+                output: Operand::Register(Register::AX),
+                obj_output: Operand::Register(Register::BX),
             })
             .into(),
         );
         instr.push(
             Instruction::Call(Call {
-                object: Some(Value::Register(Register::BX)),
-                function: Value::Register(Register::AX),
+                object: Some(Operand::Register(Register::BX)),
+                function: Operand::Register(Register::AX),
                 args: vec![array.len().into()],
             })
             .into(),
@@ -333,7 +448,7 @@ impl JSEngine {
                 ins.push(
                     Instruction::JumpIf(JumpIf {
                         if_true: true,
-                        value: Value::Register(Register::AX),
+                        value: Operand::Register(Register::AX),
                         pos: JumpPos::Label(test_label.clone()),
                     })
                     .into(),
@@ -373,7 +488,7 @@ impl JSEngine {
         Ok(ins)
     }
 
-    fn emit_conditional(
+    fn emit_conditional_expr(
         &mut self,
         test: &Expr,
         then: &Expr,
@@ -416,7 +531,7 @@ impl JSEngine {
                 ins.extend(i);
             }
             InstructionType::Value(v) => {
-                ins.push(self.set_instr(Value::Register(Register::AX), v).into());
+                ins.push(self.set_instr(Operand::Register(Register::AX), v).into());
             }
         }
         ins.push(
@@ -440,7 +555,7 @@ impl JSEngine {
                 );
             }
             InstructionType::Value(v) => {
-                ins.push(self.set_instr(Value::Register(Register::AX), v).into());
+                ins.push(self.set_instr(Operand::Register(Register::AX), v).into());
                 ins.push(
                     Instruction::Jump(Jump {
                         pos: JumpPos::Label(end_label.clone()),
@@ -457,17 +572,17 @@ impl JSEngine {
         Ok(InstructionType::Instruction(ins))
     }
 
-    fn emit_assign(
+    fn emit_assign_expr(
         &mut self,
         target: &Expr,
         op: &AssignOp,
         value: &Expr,
     ) -> Result<InstructionType, JSError> {
         let ident = self.emit_exprs(target, None)?;
-        if let InstructionType::Value(Value::Var(v)) = ident {
+        if let InstructionType::Value(Operand::Var(v)) = ident {
             let (mut ins, rv) = match self.emit_exprs(value, None)? {
                 InstructionType::Value(rv) => (vec![], rv),
-                InstructionType::Instruction(ins) => (ins, Value::Register(Register::AX)),
+                InstructionType::Instruction(ins) => (ins, Operand::Register(Register::AX)),
             };
             // `x op= y` is `x = x op y`.
             let rv = match compound_op(*op) {
@@ -475,27 +590,27 @@ impl JSEngine {
                 Some(bin) => {
                     ins.push(
                         Instruction::Binary(Binary {
-                            left: Value::Var(v.clone()),
+                            left: Operand::Var(v.clone()),
                             op: bin,
                             right: rv,
                             output: Some(Register::AX),
                         })
                         .into(),
                     );
-                    Value::Register(Register::AX)
+                    Operand::Register(Register::AX)
                 }
             };
             // An assignment is an expression whose value is the assigned
             // value, and an instruction list's result lives in AX.
-            if !matches!(rv, Value::Register(Register::AX)) {
+            if !matches!(rv, Operand::Register(Register::AX)) {
                 ins.push(
-                    self.set_instr(Value::Register(Register::AX), rv.clone())
+                    self.set_instr(Operand::Register(Register::AX), rv.clone())
                         .into(),
                 );
             }
             ins.push(
                 Instruction::Set(Set {
-                    l_value: Value::Var(v),
+                    l_value: Operand::Var(v),
                     r_value: rv,
                 })
                 .into(),
@@ -506,7 +621,7 @@ impl JSEngine {
         }
     }
 
-    fn emit_binary(
+    fn emit_binary_expr(
         &mut self,
         left: &Expr,
         op: &BinaryOp,
@@ -521,7 +636,7 @@ impl JSEngine {
             InstructionType::Value(v) => v,
             InstructionType::Instruction(l) => {
                 ins.extend(l);
-                Value::Register(Register::AX)
+                Operand::Register(Register::AX)
             }
         };
         let right = match right {
@@ -529,17 +644,17 @@ impl JSEngine {
             InstructionType::Instruction(r) => {
                 // The right side's instructions reuse AX, so move the
                 // left result out of the way first.
-                if let Value::Register(reg) = left {
+                if let Operand::Register(reg) = left {
                     let tmp = self.new_temp();
                     ins.push(Self::declare_instr(
                         tmp.clone(),
                         VariableType::Any,
-                        Value::Register(reg),
+                        Operand::Register(reg),
                     ));
-                    left = Value::Var(tmp);
+                    left = Operand::Var(tmp);
                 }
                 ins.extend(r);
-                Value::Register(Register::AX)
+                Operand::Register(Register::AX)
             }
         };
         ins.push(
@@ -554,7 +669,7 @@ impl JSEngine {
         Ok(InstructionType::Instruction(ins))
     }
 
-    fn emit_member(
+    fn emit_member_expr(
         &mut self,
         object: &Expr,
         prop: &Ident,
@@ -564,14 +679,14 @@ impl JSEngine {
         // `a.slice(1).join()`), leaving it in AX.
         let (mut ins, object) = match self.emit_exprs(object, None)? {
             InstructionType::Value(v) => (vec![], v),
-            InstructionType::Instruction(i) => (i, Value::Register(Register::AX)),
+            InstructionType::Instruction(i) => (i, Operand::Register(Register::AX)),
         };
         ins.push(
             Instruction::GetAttr(GetAttr {
                 object,
                 attrib: prop.value.clone(),
-                output: Value::Register(Register::AX),
-                obj_output: Value::Register(Register::BX),
+                output: Operand::Register(Register::AX),
+                obj_output: Operand::Register(Register::BX),
             })
             .into(),
         );
@@ -588,13 +703,13 @@ impl JSEngine {
         let mut ins = vec![];
         for arg in args {
             let name = self.new_temp();
-            names.push(Value::Var(name.clone()));
+            names.push(Operand::Var(name.clone()));
             // An instruction list leaves its result in AX. The value is copied
             // into the temp right away, before the next argument reuses AX.
             let value = match self.emit_exprs(arg, None)? {
                 InstructionType::Instruction(i) => {
                     ins.extend(i);
-                    Value::Register(Register::AX)
+                    Operand::Register(Register::AX)
                 }
                 InstructionType::Value(v) => v,
             };
@@ -606,9 +721,9 @@ impl JSEngine {
                 ins.extend(i);
                 ins.push(
                     Instruction::Call(Call {
-                        object: Some(Value::Register(Register::BX)),
+                        object: Some(Operand::Register(Register::BX)),
                         args: names,
-                        function: Value::Register(Register::AX),
+                        function: Operand::Register(Register::AX),
                     })
                     .into(),
                 );
@@ -627,23 +742,23 @@ impl JSEngine {
         Ok(InstructionType::Instruction(ins))
     }
 
-    pub fn set_instr(&self, l_value: Value, r_value: Value) -> Instruction {
+    pub fn set_instr(&self, l_value: Operand, r_value: Operand) -> Instruction {
         Instruction::Set(Set { l_value, r_value })
     }
 
-    pub fn set_register(&mut self, register: Register, value: RcPrimitive) {
+    pub fn set_register(&mut self, register: Register, value: JsValue) {
         let _ = self.registers.entry(register).and_modify(|e| *e = value);
     }
 
-    pub fn get_register(&self, register: Register) -> RcPrimitive {
+    pub fn get_register(&self, register: Register) -> JsValue {
         self.registers.get(&register).unwrap().clone()
     }
 
-    pub fn resolve_value(&self, value: &Value, scope: &Rc<Scope>) -> Result<RcPrimitive, JSError> {
+    pub fn resolve_value(&self, value: &Operand, scope: &Rc<Scope>) -> Result<JsValue, JSError> {
         let value = match value {
-            Value::Primitive(p) => p.clone(),
-            Value::Var(v) => scope.get_variable(v)?,
-            Value::Register(r) => self.get_register(*r),
+            Operand::Value(p) => p.clone(),
+            Operand::Var(v) => scope.get_variable(v)?,
+            Operand::Register(r) => self.get_register(*r),
         };
         Ok(value)
     }
@@ -656,15 +771,46 @@ impl JSEngine {
         name
     }
 
-    fn declare_instr(name: String, kind: VariableType, value: Value) -> LabelledInstruction {
+    fn declare_instr(name: String, kind: VariableType, value: Operand) -> LabelledInstruction {
         Instruction::Declare(Declare { name, kind, value }).into()
     }
 
     pub fn new_label(&mut self) -> String {
-        let label = format!("__L{}", self.labels.len());
-        self.labels.insert(label.clone(), None);
+        let label = format!("__L{}", self.labels);
+        self.labels += 1;
         label
     }
+}
+
+/// Resolves jump labels to instruction positions and removes the label
+/// markers, leaving plain instructions that can run on any engine.
+fn link(instrs: Vec<LabelledInstruction>) -> Result<Vec<Instruction>, JSError> {
+    let mut targets = HashMap::new();
+    let mut code = Vec::with_capacity(instrs.len());
+    for LabelledInstruction { label, instruction } in instrs {
+        if let Some(label) = label {
+            // A label marks the position of the next instruction kept.
+            targets.insert(label, code.len());
+            if matches!(instruction, Instruction::Noop) {
+                continue;
+            }
+        }
+        code.push(instruction);
+    }
+    for instruction in &mut code {
+        // Relative jumps would need adjusting for the removed markers;
+        // the compiler doesn't emit any.
+        if let Instruction::Jump(Jump { pos }) | Instruction::JumpIf(JumpIf { pos, .. }) =
+            instruction
+            && let JumpPos::Label(label) = pos
+        {
+            let target = targets
+                .get(label.as_str())
+                .ok_or_else(|| JSError::UnknownError(format!("unknown label {label}")))?;
+            *pos = JumpPos::Global(*target);
+        }
+    }
+    Ok(code)
 }
 
 /// `Hoist` instructions for the names a scope declares: its own `let` and
@@ -798,32 +944,27 @@ impl std::fmt::Display for JSEngine {
     }
 }
 
-impl From<RcPrimitive> for Option<Value> {
-    fn from(value: RcPrimitive) -> Self {
-        Some(Value::Primitive(value))
+impl From<JsValue> for Option<Operand> {
+    fn from(value: JsValue) -> Self {
+        Some(Operand::Value(value))
     }
 }
 
-impl From<&Literal> for Value {
+impl From<&Literal> for Operand {
     fn from(value: &Literal) -> Self {
-        Self::Primitive(value.into())
+        Self::Value(value.into())
     }
 }
 
-impl From<RcPrimitive> for Value {
-    fn from(value: RcPrimitive) -> Self {
-        Value::Primitive(value)
+impl From<JsValue> for Operand {
+    fn from(value: JsValue) -> Self {
+        Operand::Value(value)
     }
 }
 
-impl From<Primitive> for Value {
-    fn from(value: Primitive) -> Self {
-        Value::Primitive(RcPrimitive::from(value))
-    }
-}
-impl From<f64> for Value {
+impl From<f64> for Operand {
     fn from(value: f64) -> Self {
-        Self::Primitive(RcPrimitive::from(value))
+        Self::Value(JsValue::from(value))
     }
 }
 
@@ -847,7 +988,7 @@ mod tests {
 
     use super::*;
 
-    const SOURCE: &str = "let a = [1,2,3]; console.log(a.toString())";
+    const SOURCE: &str = "let a = [1,'2sss' ,3]; console.log(a.toString())";
 
     #[ignore]
     #[test]
@@ -857,7 +998,7 @@ mod tests {
     }
 
     /// Run `src` and return the value of variable `name` afterwards.
-    fn run(src: &str, name: &str) -> RcPrimitive {
+    fn run(src: &str, name: &str) -> JsValue {
         let mut engine = JSEngine::new();
         engine.exec(src).unwrap();
         engine
@@ -869,7 +1010,7 @@ mod tests {
     #[test]
     fn test_assign_ops() {
         for (src, expected) in [
-            ("let x = 10; x = 3", RcPrimitive::from(3.0)),
+            ("let x = 10; x = 3", JsValue::from(3.0)),
             ("let x = 10; x += 3", 13.0.into()),
             ("let x = 'a'; x += 'b'", "ab".into()),
             ("let x = 10; x -= 3", 7.0.into()),
@@ -911,7 +1052,7 @@ mod tests {
     #[test]
     fn test_binary_ops_in_expressions() {
         for (src, expected) in [
-            ("let r = 10 - 2 * 3", RcPrimitive::from(4.0)),
+            ("let r = 10 - 2 * 3", JsValue::from(4.0)),
             ("let r = 10 - 2 - 3", 5.0.into()),
             ("let r = 2 ** 3 ** 2", 512.0.into()),
             (
@@ -941,7 +1082,7 @@ mod tests {
     fn test_block_scoping() {
         for (src, expected) in [
             // Assigning in a block updates the outer variable.
-            ("let x = 1; { x = 3; }", RcPrimitive::from(3.0)),
+            ("let x = 1; { x = 3; }", JsValue::from(3.0)),
             ("let x = 1; { x = 2 + 3; }", 5.0.into()),
             // A `let` in a block shadows, whether or not its initializer
             // needs instructions.
@@ -977,7 +1118,7 @@ mod tests {
     #[test]
     fn test_declarations() {
         assert_eq!(run("let x; x = 4", "x"), 4.0.into());
-        assert_eq!(run("let x", "x"), Primitive::Undefined.into());
+        assert_eq!(run("let x", "x"), JsValue::Undefined);
         assert_eq!(run("const c = 1 + 1", "c"), 2.0.into());
         assert_eq!(run("let a = 1, b = a + 1", "b"), 2.0.into());
         let mut engine = JSEngine::new();
@@ -997,7 +1138,7 @@ mod tests {
         for (src, expected) in [
             (
                 "let x = 0; if (1 < 2) { x = 1 } else { x = 2 }",
-                RcPrimitive::from(1.0),
+                JsValue::from(1.0),
             ),
             ("let x = 0; if (2 < 1) { x = 1 } else { x = 2 }", 2.0.into()),
             // Single-statement branches, no braces.
@@ -1197,10 +1338,7 @@ mod tests {
             "the initializer still runs at its own line"
         );
         // Hoisting moves the declaration only, not the initializer.
-        assert_eq!(
-            run("let y = x; var x = 3;", "y"),
-            Primitive::Undefined.into()
-        );
+        assert_eq!(run("let y = x; var x = 3;", "y"), JsValue::Undefined);
         assert_eq!(run("let y = x; var x = 3;", "x"), 3.0.into());
     }
 
@@ -1270,6 +1408,177 @@ mod tests {
             run("let r = 0; { r = 1; const c = r + 1; r = c * 10 }", "r"),
             20.0.into()
         );
+    }
+
+    #[test]
+    fn test_compiled_code_is_linked() {
+        let src = "let x = 0; if (x < 1) { x = 1 } else { x = 2 } let y = x > 0 ? 'a' : 'b'";
+        let mut compiler = JSEngine::new();
+        compiler.verbose = false;
+        let program = compiler.parse(src).unwrap();
+        let code = compiler.compile(&program).unwrap();
+        for instruction in &code {
+            assert!(
+                !matches!(instruction, Instruction::Noop),
+                "label markers are removed"
+            );
+            if let Instruction::Jump(Jump { pos }) | Instruction::JumpIf(JumpIf { pos, .. }) =
+                instruction
+            {
+                assert!(
+                    matches!(pos, JumpPos::Global(target) if *target <= code.len()),
+                    "jump not linked: {pos:?}"
+                );
+            }
+        }
+        // Linked code doesn't depend on the engine that compiled it.
+        let mut runner = JSEngine::new();
+        runner.verbose = false;
+        runner.run(&code).unwrap();
+        assert_eq!(runner.scope.get_variable("x").unwrap(), 1.0.into());
+        assert_eq!(runner.scope.get_variable("y").unwrap(), "a".into());
+    }
+
+    #[test]
+    fn test_temporaries_are_reused_across_statements() {
+        // Each statement needs a temporary (a call argument, and the left side
+        // of a sum whose right side is computed).
+        let statement = "n = (n + a.length) + a.indexOf(n);";
+        let src = format!("let a = [1, 2]; let n = 0; {}", statement.repeat(50));
+        let mut engine = JSEngine::new();
+        engine.verbose = false;
+        engine.exec(&src).unwrap();
+        let temps = engine
+            .scope
+            .vars
+            .borrow()
+            .keys()
+            .filter(|name| name.starts_with("__t"))
+            .count();
+        assert!(temps <= 2, "{temps} temporaries in the global scope");
+    }
+
+    #[test]
+    fn test_finished_scopes_are_freed() {
+        let mut engine = JSEngine::new();
+        engine.verbose = false;
+        engine
+            .exec("let x = 0; { let a = [1]; { let b = 2; x = b; } } if (true) { let c = 3; }")
+            .unwrap();
+        // Every variable and every child scope holds a weak reference to its
+        // scope. Once execution leaves the blocks, only the global variables'
+        // references should remain.
+        let globals = engine.scope.vars.borrow().len();
+        assert_eq!(Rc::weak_count(&engine.scope), globals);
+    }
+
+    #[test]
+    fn test_for_basic() {
+        let src = "let s = 0; for (let i = 0; i < 5; i = i + 1) { s = s + i }";
+        assert_eq!(run(src, "s"), 10.0.into());
+    }
+
+    #[test]
+    fn test_for_var_and_expression_init() {
+        // `var` in the head is visible after the loop.
+        let src = "let s = 0; for (var i = 0; i < 5; i = i + 1) { s = s + i }";
+        assert_eq!(run(src, "s"), 10.0.into());
+        assert_eq!(run(src, "i"), 5.0.into());
+        // An expression as init, and a body without braces.
+        let src = "let s = 0; let i; for (i = 0; i < 5; i = i + 1) s = s + i;";
+        assert_eq!(run(src, "s"), 10.0.into());
+        assert_eq!(run(src, "i"), 5.0.into());
+    }
+
+    #[test]
+    fn test_for_false_test_skips_body() {
+        let src = "let s = 7; let i; for (i = 10; i < 5; i = i + 1) { s = 0 }";
+        assert_eq!(run(src, "s"), 7.0.into());
+        assert_eq!(run(src, "i"), 10.0.into(), "the update doesn't run either");
+    }
+
+    #[test]
+    fn test_for_optional_parts() {
+        // No init and no update.
+        assert_eq!(
+            run("let i = 0; for (; i < 3;) { i = i + 1 }", "i"),
+            3.0.into()
+        );
+        // A test that's a plain variable rather than a computed value.
+        let src = "let n = 3; let c = 0; for (; n;) { n = n - 1; c = c + 1 }";
+        assert_eq!(run(src, "c"), 3.0.into());
+        assert_eq!(run(src, "n"), 0.0.into());
+    }
+
+    #[test]
+    fn test_for_without_test_runs_the_body() {
+        // With no `break` yet, end the infinite loop by failing in the body:
+        // the error proves the body ran.
+        let mut engine = JSEngine::new();
+        engine.verbose = false;
+        let result = engine.exec("let x = 0; for (;;) { x = 1; undeclared = 2; }");
+        assert!(
+            matches!(result, Err(JSError::ObjectNotFound(_))),
+            "{result:?}"
+        );
+        assert_eq!(engine.scope.get_variable("x").unwrap(), 1.0.into());
+    }
+
+    #[test]
+    fn test_for_nested() {
+        let src = "let s = 0; for (let i = 0; i < 3; i = i + 1) { for (let j = 0; j < 4; j = j + 1) { s = s + 1 } }";
+        assert_eq!(run(src, "s"), 12.0.into());
+        let src = "let s = ''; for (let i = 0; i < 2; i = i + 1) { for (let j = 0; j < 2; j = j + 1) { s = s + i + j + ' ' } }";
+        assert_eq!(run(src, "s"), "00 01 10 11 ".into());
+    }
+
+    #[test]
+    fn test_for_scoping() {
+        // A `let` in the body is per iteration and doesn't touch outer names.
+        let src = "let x = 1; for (let i = 0; i < 3; i = i + 1) { let x = i }";
+        assert_eq!(run(src, "x"), 1.0.into());
+        // A `let` in the head is scoped to the loop.
+        let mut engine = JSEngine::new();
+        engine.verbose = false;
+        engine.exec("for (let i = 0; i < 3; i = i + 1) {}").unwrap();
+        assert!(matches!(
+            engine.scope.get_variable("i"),
+            Err(JSError::ReferenceError(_))
+        ));
+    }
+
+    #[test]
+    fn test_for_with_arrays_and_temporaries() {
+        let src =
+            "let a = []; for (let i = 0; i < 4; i = i + 1) { a.push(i * i) } let s = a.join()";
+        assert_eq!(run(src, "s"), "0,1,4,9".into());
+        // The test and update need temporaries of their own.
+        let src = "let a = [1, 2, 3]; let s = 0; for (let i = 0; i < a.length + 0; i = i + a.indexOf(1) + 1) { s = s + a.at(i) }";
+        assert_eq!(run(src, "s"), 6.0.into());
+    }
+
+    #[test]
+    fn test_for_many_iterations_frees_each_iteration() {
+        let mut engine = JSEngine::new();
+        engine.verbose = false;
+        engine
+            .exec("let s = 0; for (let i = 0; i < 10000; i = i + 1) { let a = [i, i]; s = s + a.length }")
+            .unwrap();
+        assert_eq!(engine.scope.get_variable("s").unwrap(), 20000.0.into());
+        let globals = engine.scope.vars.borrow().len();
+        assert_eq!(
+            Rc::weak_count(&engine.scope),
+            globals,
+            "the loop's scopes are freed after it finishes"
+        );
+        let temps = engine
+            .scope
+            .vars
+            .borrow()
+            .keys()
+            .filter(|n| n.starts_with("__t"))
+            .count();
+        assert!(temps <= 2, "{temps} temporaries");
     }
 
     #[test]

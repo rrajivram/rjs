@@ -1,5 +1,5 @@
 [workspace]
-members=["macros", "rjs_core", "vm"]
+members=["macros", "rjs_core", "vm", "bench"]
 resolver="3"
 
 [profile.release]

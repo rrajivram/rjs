@@ -8,9 +8,9 @@ use std::{
 use crate::{
     builtin::array::Array,
     error::JSError,
-    executor::{engine::JSEngine, instr::Value, scope::Scope},
+    executor::{engine::JSEngine, instr::Operand, scope::Scope},
     primitive::{
-        Func, Primitive, RcPrimitive,
+        Func, JsValue,
         proto::{Prototype, RcPrototype},
     },
 };
@@ -19,7 +19,7 @@ pub trait Object: Debug {
     fn prototype(&self) -> RcPrototype;
     fn get_props(&self) -> Vec<String>;
     fn get_methods(&self) -> Vec<String>;
-    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError>;
+    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError>;
     fn has_prop(&self, prop: &str) -> bool;
     fn has_method(&self, method: &str) -> bool;
     fn call(
@@ -27,12 +27,12 @@ pub trait Object: Debug {
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
         method: &Func,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError>;
-    fn value_of(&self) -> Result<Primitive, JSError> {
-        Ok(Primitive::Null)
+    fn value_of(&self) -> Result<JsValue, JSError> {
+        Ok(JsValue::Null)
     }
-    fn set_prop(&self, _prop: &str, _value: RcPrimitive) -> Result<(), JSError> {
+    fn set_prop(&self, _prop: &str, _value: JsValue) -> Result<(), JSError> {
         Ok(())
     }
     fn type_of(&self) -> String;
@@ -45,35 +45,35 @@ pub trait Object: Debug {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectPrimitive {
     prototype: RcPrototype,
-    props: RefCell<BTreeMap<String, RcPrimitive>>,
+    props: RefCell<BTreeMap<String, JsValue>>,
 }
 
 thread_local! {
     static OBJ_PROTO: RcPrototype = Prototype::create(HashMap::from([
-        ("valueOf".into(),RcPrimitive::from(Primitive::Function("valueOf".into()))),
-        ("toString".into(),RcPrimitive::from(Primitive::Function("toString".into()))),
-        ("typeOf".into(),RcPrimitive::from(Primitive::Function("typeOf".into()))),
-        ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+        ("valueOf".into(),JsValue::Function("valueOf".into())),
+        ("toString".into(),JsValue::Function("toString".into())),
+        ("typeOf".into(),JsValue::Function("typeOf".into())),
+        ("prototype".into(),JsValue::Undefined)
     ]),None).into();
 }
 
 impl ObjectPrimitive {
-    pub fn new(props: BTreeMap<String, RcPrimitive>) -> Self {
+    pub fn new(props: BTreeMap<String, JsValue>) -> Self {
         let prototype = RcPrototype::from(Prototype::create(
             HashMap::from([
                 (
                     "valueOf".into(),
-                    RcPrimitive::from(Primitive::Function("valueOf".into())),
+                    JsValue::Function("valueOf".into()),
                 ),
                 (
                     "toString".into(),
-                    RcPrimitive::from(Primitive::Function("toString".into())),
+                    JsValue::Function("toString".into()),
                 ),
                 (
                     "typeOf".into(),
-                    RcPrimitive::from(Primitive::Function("typeOf".into())),
+                    JsValue::Function("typeOf".into()),
                 ),
-                ("prototype".into(), RcPrimitive::from(Primitive::Undefined)),
+                ("prototype".into(), JsValue::Undefined),
             ]),
             None,
         ));
@@ -114,13 +114,13 @@ impl Object for ObjectPrimitive {
         _engine: &mut JSEngine,
         _scope: &Rc<Scope>,
         method: &Func,
-        _args: &[Value],
+        _args: &[Operand],
     ) -> Result<(), JSError> {
         //let _ = self.get_args(engine)?;
         Err(JSError::MethodNotFound(method.to_string()))
     }
 
-    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, JSError> {
+    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError> {
         self.props
             .borrow()
             .get(prop)
@@ -128,7 +128,7 @@ impl Object for ObjectPrimitive {
             .ok_or(JSError::ReferenceError(prop.into()))
     }
 
-    fn set_prop(&self, prop: &str, value: RcPrimitive) -> Result<(), JSError> {
+    fn set_prop(&self, prop: &str, value: JsValue) -> Result<(), JSError> {
         self.props.borrow_mut().insert(prop.to_string(), value);
         Ok(())
     }

@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
@@ -11,7 +10,7 @@ use rjs_core::literal::{Literal, NumberValue};
 
 use crate::{
     error::JSError,
-    executor::instr::Value,
+    executor::instr::Operand,
     primitive::{
         func::Func,
         objects::Object,
@@ -27,11 +26,13 @@ pub mod objects;
 pub mod ops;
 pub mod proto;
 
+/// Any JavaScript value. Cheap to clone: strings, objects and functions are
+/// reference-counted, and everything else is stored inline.
 #[derive(Debug, Clone)]
-pub enum Primitive {
+pub enum JsValue {
     Number(f64),
     BigInt(i128),
-    Str(String),
+    Str(Rc<str>),
     Bool(bool),
     Null,
     Undefined,
@@ -40,12 +41,9 @@ pub enum Primitive {
     Function(Func),
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct RcPrimitive(pub Rc<Primitive>);
-
-impl PartialEq for Primitive {
+impl PartialEq for JsValue {
     fn eq(&self, other: &Self) -> bool {
-        use Primitive::*;
+        use JsValue::*;
         match (self, other) {
             (Number(a), Number(b)) => a == b || (a.is_nan() && b.is_nan()),
             (BigInt(a), BigInt(b)) => a == b,
@@ -60,14 +58,14 @@ impl PartialEq for Primitive {
     }
 }
 
-impl Eq for Primitive {}
+impl Eq for JsValue {}
 
-impl Hash for Primitive {
+impl Hash for JsValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
             // Equal values must hash equally: fold -0 into 0 and all NaNs into one.
-            Primitive::Number(n) => {
+            JsValue::Number(n) => {
                 let n = if *n == 0.0 {
                     0.0
                 } else if n.is_nan() {
@@ -77,129 +75,101 @@ impl Hash for Primitive {
                 };
                 n.to_bits().hash(state)
             }
-            Primitive::BigInt(n) => n.hash(state),
-            Primitive::Str(s) => s.hash(state),
-            Primitive::Bool(b) => b.hash(state),
-            Primitive::Symbol(s) => s.hash(state),
-            Primitive::Object(o) => (Rc::as_ptr(o) as *const () as usize).hash(state),
-            Primitive::Function(f) => f.hash(state),
+            JsValue::BigInt(n) => n.hash(state),
+            JsValue::Str(s) => s.hash(state),
+            JsValue::Bool(b) => b.hash(state),
+            JsValue::Symbol(s) => s.hash(state),
+            JsValue::Object(o) => (Rc::as_ptr(o) as *const () as usize).hash(state),
+            JsValue::Function(f) => f.hash(state),
             _ => {}
         }
     }
 }
 
-impl Display for Primitive {
+impl Display for JsValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Primitive::Number(n) => n.to_string(),
-            Primitive::BigInt(n) => n.to_string(),
-            Primitive::Str(s) => s.clone(),
-            Primitive::Bool(b) => b.to_string(),
-            Primitive::Null => "null".into(),
-            Primitive::Undefined => "undefined".into(),
-            Primitive::Symbol(_) => "symbol".into(),
-            Primitive::Object(_object) => "object Object".into(),
-            Primitive::Function(f) => format!("Function({f})"),
+            JsValue::Number(n) => n.to_string(),
+            JsValue::BigInt(n) => n.to_string(),
+            JsValue::Str(s) => s.to_string(),
+            JsValue::Bool(b) => b.to_string(),
+            JsValue::Null => "null".into(),
+            JsValue::Undefined => "undefined".into(),
+            JsValue::Symbol(_) => "symbol".into(),
+            JsValue::Object(_object) => "object Object".into(),
+            JsValue::Function(f) => format!("Function({f})"),
         };
         f.write_str(&s)
     }
 }
 
-impl Default for RcPrimitive {
-    fn default() -> Self {
-        Self(Rc::new(Primitive::Number(0.)))
-    }
-}
-
-impl Add for RcPrimitive {
+impl Add for JsValue {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
-        let res: Self = match (self.0.as_ref(), rhs.0.as_ref()) {
-            (Primitive::Number(n), Primitive::Number(n1)) => Primitive::Number(n + n1).into(),
-            (Primitive::BigInt(n), Primitive::BigInt(n1)) => Primitive::BigInt(n + n1).into(),
-            (Primitive::BigInt(n), Primitive::Number(n1)) => {
-                Primitive::BigInt(n + *n1 as i128).into()
-            }
-            (Primitive::Number(n), Primitive::BigInt(n1)) => {
-                Primitive::Number(n + *n1 as f64).into()
-            }
-            (Primitive::Str(s1), Primitive::Str(s2)) => Primitive::Str(format!("{s1}{s2}")).into(),
-            (Primitive::Str(s), Primitive::BigInt(b)) => Primitive::Str(format!("{s}{b}")).into(),
-            (Primitive::Str(s), Primitive::Number(b)) => Primitive::Str(format!("{s}{b}")).into(),
-            (Primitive::Str(s), Primitive::Bool(b)) => Primitive::Str(format!("{s}{b}")).into(),
-            (Primitive::BigInt(s), Primitive::Str(b)) => Primitive::Str(format!("{s}{b}")).into(),
-            (Primitive::Number(s), Primitive::Str(b)) => Primitive::Str(format!("{s}{b}")).into(),
-            (Primitive::Bool(s), Primitive::Str(b)) => Primitive::Str(format!("{s}{b}")).into(),
-
-            (_, _) => Primitive::Null.into(),
-        };
-        res
+        let concat = |a: &dyn Display, b: &dyn Display| JsValue::Str(format!("{a}{b}").into());
+        match (&self, &rhs) {
+            (JsValue::Number(n), JsValue::Number(n1)) => JsValue::Number(n + n1),
+            (JsValue::BigInt(n), JsValue::BigInt(n1)) => JsValue::BigInt(n + n1),
+            (JsValue::BigInt(n), JsValue::Number(n1)) => JsValue::BigInt(n + *n1 as i128),
+            (JsValue::Number(n), JsValue::BigInt(n1)) => JsValue::Number(n + *n1 as f64),
+            (JsValue::Str(s1), JsValue::Str(s2)) => concat(s1, s2),
+            (JsValue::Str(s), JsValue::BigInt(b)) => concat(s, b),
+            (JsValue::Str(s), JsValue::Number(b)) => concat(s, b),
+            (JsValue::Str(s), JsValue::Bool(b)) => concat(s, b),
+            (JsValue::BigInt(s), JsValue::Str(b)) => concat(s, b),
+            (JsValue::Number(s), JsValue::Str(b)) => concat(s, b),
+            (JsValue::Bool(s), JsValue::Str(b)) => concat(s, b),
+            (_, _) => JsValue::Null,
+        }
     }
 }
 
-impl From<Primitive> for RcPrimitive {
-    fn from(value: Primitive) -> Self {
-        Self(Rc::new(value))
-    }
-}
-
-impl Display for RcPrimitive {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl From<&Literal> for RcPrimitive {
+impl From<&Literal> for JsValue {
     fn from(value: &Literal) -> Self {
-        let val = match value {
-            Literal::Boolean(b) => Primitive::Bool(b.value()),
-            Literal::Null(_) => Primitive::Null,
+        match value {
+            Literal::Boolean(b) => JsValue::Bool(b.value()),
+            Literal::Null(_) => JsValue::Null,
             Literal::Number(n) => match &n.value {
-                NumberValue::Float(f) => Primitive::Number(*f),
-                NumberValue::Int(i) => Primitive::Number(*i as f64),
+                NumberValue::Float(f) => JsValue::Number(*f),
+                NumberValue::Int(i) => JsValue::Number(*i as f64),
             },
-            Literal::String(s) => Primitive::Str(s.value.clone()),
-        };
-        Self(Rc::new(val))
+            Literal::String(s) => JsValue::Str(s.value.as_str().into()),
+        }
     }
 }
-impl From<Literal> for RcPrimitive {
+
+impl From<Literal> for JsValue {
     fn from(value: Literal) -> Self {
         Self::from(&value)
     }
 }
 
-impl From<f64> for RcPrimitive {
+impl From<f64> for JsValue {
     fn from(value: f64) -> Self {
-        Self(Rc::new(Primitive::Number(value)))
+        JsValue::Number(value)
     }
 }
 
-impl From<bool> for RcPrimitive {
+impl From<bool> for JsValue {
     fn from(value: bool) -> Self {
-        Self(Rc::new(Primitive::Bool(value)))
+        JsValue::Bool(value)
     }
 }
 
-impl From<String> for RcPrimitive {
+impl From<String> for JsValue {
     fn from(value: String) -> Self {
-        Self(Rc::new(Primitive::Str(value)))
+        JsValue::Str(value.into())
     }
 }
 
-impl From<&str> for RcPrimitive {
+impl From<&str> for JsValue {
     fn from(value: &str) -> Self {
-        Self(Rc::new(Primitive::Str(value.to_string())))
+        JsValue::Str(value.into())
     }
 }
 
-impl AsRef<Primitive> for RcPrimitive {
-    fn as_ref(&self) -> &Primitive {
-        &self.0
-    }
-}
 
-impl Primitive {
+impl JsValue {
     pub fn to_str(&self) -> String {
         format!("{self}")
     }
@@ -207,14 +177,14 @@ impl Primitive {
 
 thread_local! {
 static PRIMITIVE_PROTO:RcPrototype = Prototype::create(HashMap::from([
-    ("valueOf".into(),RcPrimitive::from(Primitive::Function("valueOf".into()))),
-    ("toString".into(),RcPrimitive::from(Primitive::Function("toString".into()))),
-    ("typeOf".into(),RcPrimitive::from(Primitive::Function("typeOf".into()))),
-    ("prototype".into(),RcPrimitive::from(Primitive::Undefined))
+    ("valueOf".into(),JsValue::Function("valueOf".into())),
+    ("toString".into(),JsValue::Function("toString".into())),
+    ("typeOf".into(),JsValue::Function("typeOf".into())),
+    ("prototype".into(),JsValue::Undefined)
 ]),None).into();
 }
 
-impl Object for Primitive {
+impl Object for JsValue {
     fn prototype(&self) -> RcPrototype {
         PRIMITIVE_PROTO.with(|v| v.clone())
     }
@@ -227,7 +197,7 @@ impl Object for Primitive {
         todo!()
     }
 
-    fn get_prop(&self, prop: &str) -> Result<RcPrimitive, crate::error::JSError> {
+    fn get_prop(&self, prop: &str) -> Result<JsValue, crate::error::JSError> {
         if let Self::Object(obj) = self {
             Ok(obj.get_prop(prop)?)
         } else {
@@ -235,7 +205,7 @@ impl Object for Primitive {
         }
     }
 
-    fn set_prop(&self, prop: &str, value: RcPrimitive) -> Result<(), JSError> {
+    fn set_prop(&self, prop: &str, value: JsValue) -> Result<(), JSError> {
         if let Self::Object(obj) = self {
             Ok(obj.set_prop(prop, value)?)
         } else {
@@ -256,7 +226,7 @@ impl Object for Primitive {
         engine: &mut crate::executor::engine::JSEngine,
         scope: &Rc<crate::executor::scope::Scope>,
         method: &Func,
-        args: &[Value],
+        args: &[Operand],
     ) -> Result<(), JSError> {
         if let Self::Object(ob) = self {
             Ok(ob.call(engine, scope, method, args)?)
@@ -265,25 +235,25 @@ impl Object for Primitive {
         }
     }
 
-    fn value_of(&self) -> Result<Primitive, JSError> {
+    fn value_of(&self) -> Result<JsValue, JSError> {
         let res = self.to_number();
         match res {
-            Ok(f) => Ok(Primitive::Number(f)),
-            Err(_) => Ok(Primitive::Null),
+            Ok(f) => Ok(JsValue::Number(f)),
+            Err(_) => Ok(JsValue::Null),
         }
     }
 
     fn type_of(&self) -> String {
         match self {
-            Primitive::Number(_) => "Number".into(),
-            Primitive::BigInt(_) => "BigInteger".into(),
-            Primitive::Str(_) => "String".into(),
-            Primitive::Bool(_) => "Boolean".into(),
-            Primitive::Null => "(Null)".into(),
-            Primitive::Undefined => "(Undefined)".into(),
-            Primitive::Symbol(_) => "Symbol".into(),
-            Primitive::Object(object) => object.type_of(),
-            Primitive::Function(_func) => "Function".into(),
+            JsValue::Number(_) => "Number".into(),
+            JsValue::BigInt(_) => "BigInteger".into(),
+            JsValue::Str(_) => "String".into(),
+            JsValue::Bool(_) => "Boolean".into(),
+            JsValue::Null => "(Null)".into(),
+            JsValue::Undefined => "(Undefined)".into(),
+            JsValue::Symbol(_) => "Symbol".into(),
+            JsValue::Object(object) => object.type_of(),
+            JsValue::Function(_func) => "Function".into(),
         }
     }
 }

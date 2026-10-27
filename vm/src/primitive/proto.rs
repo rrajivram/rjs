@@ -1,10 +1,10 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use crate::{error::JSError, primitive::RcPrimitive};
+use crate::{error::JSError, primitive::JsValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prototype {
-    pub proto: RefCell<HashMap<String, RcPrimitive>>,
+    pub proto: RefCell<HashMap<String, JsValue>>,
     pub parent: Option<RcPrototype>,
 }
 
@@ -12,19 +12,19 @@ pub struct Prototype {
 pub struct RcPrototype(pub Rc<RefCell<Prototype>>);
 
 impl Prototype {
-    pub fn create(map: HashMap<String, RcPrimitive>, parent: Option<RcPrototype>) -> Self {
+    pub fn create(map: HashMap<String, JsValue>, parent: Option<RcPrototype>) -> Self {
         Self {
             proto: RefCell::from(map),
             parent,
         }
     }
 
-    pub fn add(&self, name: &str, value: RcPrimitive) -> Result<(), JSError> {
+    pub fn add(&self, name: &str, value: JsValue) -> Result<(), JSError> {
         let _ = self.proto.borrow_mut().insert(name.to_string(), value);
         Ok(())
     }
 
-    pub fn get(&self, name: &str) -> Result<RcPrimitive, JSError> {
+    pub fn get(&self, name: &str) -> Result<JsValue, JSError> {
         if let Some(val) = self.proto.borrow().get(name) {
             Ok(val.clone())
         } else {

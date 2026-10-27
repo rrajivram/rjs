@@ -9,13 +9,15 @@ use rjs_core::statement::DeclKind;
 use crate::{
     builtin::{array::Array, console::Console},
     error::JSError,
-    primitive::{Primitive, RcPrimitive},
+    primitive::{JsValue},
 };
 
+/// Variables visible at one level of nesting. A scope only knows its parent:
+/// lookups go upward, and nothing keeps a scope alive once execution has
+/// left it.
 #[derive(Debug, Default)]
 pub struct Scope {
     pub vars: RefCell<HashMap<String, Rc<RefCell<Variable>>>>,
-    pub child_scopes: RefCell<Vec<Rc<Scope>>>,
     pub parent: Option<Weak<Scope>>,
 }
 
@@ -31,7 +33,7 @@ pub enum VariableType {
 pub struct Variable {
     name: String,
     vtype: VariableType,
-    value: RcPrimitive,
+    value: JsValue,
     parent: Weak<Scope>,
 }
 
@@ -44,7 +46,7 @@ impl Variable {
     pub fn new(
         name: &str,
         vtype: VariableType,
-        value: RcPrimitive,
+        value: JsValue,
         parent: Weak<Scope>,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
@@ -55,7 +57,7 @@ impl Variable {
         }))
     }
 
-    pub fn set(&mut self, value: RcPrimitive) -> Result<(), JSError> {
+    pub fn set(&mut self, value: JsValue) -> Result<(), JSError> {
         if let VariableType::Const = self.vtype {
             return Err(JSError::InvalidReassign(self.name.clone()));
         }
@@ -65,7 +67,7 @@ impl Variable {
 
     /// Give a declared variable its value at its declaration line. Unlike
     /// `set`, this is allowed for `const`, which is set exactly once this way.
-    pub fn init(&mut self, value: RcPrimitive) {
+    pub fn init(&mut self, value: JsValue) {
         self.value = value;
     }
 
@@ -78,32 +80,29 @@ impl Scope {
     pub fn create_default() -> Rc<Self> {
         let this = Rc::new(Self {
             vars: RefCell::new(HashMap::new()),
-            child_scopes: RefCell::new(vec![]),
             parent: None,
         });
-        let console = Primitive::Object(Rc::new(Console::new()));
-        this.add_variable("console", VariableType::Const, RcPrimitive::from(console))
+        let console = JsValue::Object(Rc::new(Console::new()));
+        this.add_variable("console", VariableType::Const, console)
             .unwrap();
-        let array = Primitive::Object(Rc::new(Array::new()));
-        this.add_variable("Array", VariableType::Const, array.into())
+        let array = JsValue::Object(Rc::new(Array::new()));
+        this.add_variable("Array", VariableType::Const, array)
             .unwrap();
         this
     }
 
     pub fn create(parent: Rc<Scope>) -> Rc<Self> {
-        let this = Rc::new(Self {
+        Rc::new(Self {
             parent: Some(Rc::downgrade(&parent)),
             ..Default::default()
-        });
-        parent.child_scopes.borrow_mut().push(this.clone());
-        this
+        })
     }
 
     pub fn add_variable(
         self: &Rc<Self>,
         name: &str,
         vtype: VariableType,
-        value: RcPrimitive,
+        value: JsValue,
     ) -> Result<(), JSError> {
         let var = Variable::new(name, vtype, value, Rc::downgrade(self));
         self.vars.borrow_mut().insert(name.into(), var);
@@ -111,7 +110,7 @@ impl Scope {
     }
 
     #[allow(clippy::bind_instead_of_map)]
-    pub fn get_variable(self: &Rc<Self>, name: &str) -> Result<RcPrimitive, JSError> {
+    pub fn get_variable(self: &Rc<Self>, name: &str) -> Result<JsValue, JSError> {
         if let Some(var) = self.vars.borrow().get(name) {
             Ok(var.borrow().value.clone())
         } else {
@@ -132,7 +131,7 @@ impl Scope {
         self.parent.as_ref()?.upgrade()?.find_variable(name)
     }
 
-    pub fn set_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
+    pub fn set_variable(self: &Rc<Self>, name: &str, value: JsValue) -> Result<(), JSError> {
         self.find_variable(name)
             .ok_or_else(|| JSError::ObjectNotFound(name.into()))?
             .borrow_mut()
@@ -141,7 +140,7 @@ impl Scope {
 
     /// Run a declaration's initializer: like `set_variable`, but allowed for
     /// `const`.
-    pub fn init_variable(self: &Rc<Self>, name: &str, value: RcPrimitive) -> Result<(), JSError> {
+    pub fn init_variable(self: &Rc<Self>, name: &str, value: JsValue) -> Result<(), JSError> {
         self.find_variable(name)
             .ok_or_else(|| JSError::ObjectNotFound(name.into()))?
             .borrow_mut()
@@ -182,27 +181,17 @@ impl std::fmt::Display for Variable {
     }
 }
 
-impl Scope {
-    fn fmt_tree(&self, f: &mut std::fmt::Formatter<'_>, depth: usize) -> std::fmt::Result {
-        let pad = "  ".repeat(depth);
-        writeln!(f, "{pad}scope {{")?;
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "scope {{")?;
         let vars = self.vars.borrow();
         // HashMap order is random; sort so output is stable between runs.
         let mut names: Vec<_> = vars.keys().collect();
         names.sort();
         for name in names {
-            writeln!(f, "{pad}  {}", vars[name].borrow())?;
+            writeln!(f, "  {}", vars[name].borrow())?;
         }
-        for child in self.child_scopes.borrow().iter() {
-            child.fmt_tree(f, depth + 1)?;
-        }
-        writeln!(f, "{pad}}}")
-    }
-}
-
-impl std::fmt::Display for Scope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.fmt_tree(f, 0)
+        writeln!(f, "}}")
     }
 }
 
@@ -210,17 +199,17 @@ impl std::fmt::Display for Scope {
 mod tests {
     use std::rc::Rc;
 
-    use crate::{error::JSError, executor::scope::Scope, primitive::RcPrimitive};
+    use crate::{error::JSError, executor::scope::Scope, primitive::JsValue};
 
     #[test]
     fn test_scope_var() {
         let scope = Rc::new(Scope::default());
         scope
-            .add_variable("test", super::VariableType::Any, RcPrimitive::from(1.))
+            .add_variable("test", super::VariableType::Any, JsValue::from(1.))
             .unwrap();
         let v = scope.get_variable("test").unwrap();
-        assert!(v == RcPrimitive::from(1.));
-        assert!(v != RcPrimitive::from(2.));
+        assert!(v == JsValue::from(1.));
+        assert!(v != JsValue::from(2.));
         assert!(matches!(
             scope.get_variable("test1"),
             Err(JSError::ReferenceError(_))
@@ -234,15 +223,15 @@ mod tests {
             .add_variable(
                 "test",
                 crate::executor::scope::VariableType::Any,
-                RcPrimitive::from(2.0),
+                JsValue::from(2.0),
             )
             .unwrap();
         let child = Scope::create(scope.clone());
         child
-            .add_variable("test1", super::VariableType::Any, RcPrimitive::from(1.0))
+            .add_variable("test1", super::VariableType::Any, JsValue::from(1.0))
             .unwrap();
-        assert!(child.get_variable("test1").unwrap() == RcPrimitive::from(1.0));
-        assert!(child.get_variable("test").unwrap() == RcPrimitive::from(2.0));
+        assert!(child.get_variable("test1").unwrap() == JsValue::from(1.0));
+        assert!(child.get_variable("test").unwrap() == JsValue::from(2.0));
         assert!(matches!(
             scope.get_variable("test1"),
             Err(JSError::ReferenceError(_))
@@ -253,11 +242,11 @@ mod tests {
     fn test_set_variable_while_shared() {
         let scope = Rc::new(Scope::default());
         scope
-            .add_variable("x", super::VariableType::Let, RcPrimitive::from(1.0))
+            .add_variable("x", super::VariableType::Let, JsValue::from(1.0))
             .unwrap();
         // A second handle to the variable, as a closure capturing it would hold.
         let _shared = scope.vars.borrow()["x"].clone();
-        scope.set_variable("x", RcPrimitive::from(2.0)).unwrap();
-        assert_eq!(scope.get_variable("x").unwrap(), RcPrimitive::from(2.0));
+        scope.set_variable("x", JsValue::from(2.0)).unwrap();
+        assert_eq!(scope.get_variable("x").unwrap(), JsValue::from(2.0));
     }
 }

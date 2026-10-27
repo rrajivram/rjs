@@ -1,7 +1,7 @@
-use std::fmt::Display;
+use std::{fmt::Display, rc::Rc};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Func(pub String);
+pub struct Func(pub Rc<str>);
 
 impl AsRef<str> for Func {
     fn as_ref(&self) -> &str {
@@ -17,7 +17,7 @@ impl From<&str> for Func {
 
 impl From<String> for Func {
     fn from(value: String) -> Self {
-        Self(value)
+        Self(value.into())
     }
 }
 

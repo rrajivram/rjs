@@ -8,7 +8,7 @@ use crate::{
         engine::{JSEngine, Register},
         scope::{Scope, VariableType},
     },
-    primitive::{Primitive, RcPrimitive, jstack::StackValue, objects::Object},
+    primitive::{JsValue, objects::Object},
 };
 
 #[derive(Debug, Clone)]
@@ -32,42 +32,42 @@ pub enum Instruction {
 
 #[derive(Debug, Clone)]
 pub struct Binary {
-    pub left: Value,
+    pub left: Operand,
     pub op: BinaryOp,
-    pub right: Value,
+    pub right: Operand,
     pub output: Option<Register>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Push {
-    pub value: Value,
+    pub value: Operand,
 }
 
 #[derive(Debug, Clone)]
 pub struct Pop {
-    pub value: Option<Value>,
+    pub value: Option<Operand>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Call {
-    pub object: Option<Value>,
-    pub function: Value,
-    pub args: Vec<Value>,
+    pub object: Option<Operand>,
+    pub function: Operand,
+    pub args: Vec<Operand>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GetAttr {
-    pub object: Value,
+    pub object: Operand,
     pub attrib: String,
-    pub output: Value,
-    pub obj_output: Value,
+    pub output: Operand,
+    pub obj_output: Operand,
 }
 
 #[derive(Debug, Clone)]
 pub struct SetAttr {
-    pub object: Value,
+    pub object: Operand,
     pub attrib: String,
-    pub input: Value,
+    pub input: Operand,
 }
 
 /// Create a scope's declared name at the start of the scope, as `undefined`,
@@ -84,7 +84,7 @@ pub struct Hoist {
 #[derive(Debug, Clone)]
 pub struct Init {
     pub name: String,
-    pub value: Value,
+    pub value: Operand,
 }
 
 /// Create a variable in the current scope, initialized to `value`
@@ -93,28 +93,30 @@ pub struct Init {
 pub struct Declare {
     pub name: String,
     pub kind: VariableType,
-    pub value: Value,
+    pub value: Operand,
 }
 
 /// Assign to an existing variable or a register. Variables are looked up
 /// through enclosing scopes; assigning to an undeclared one is an error.
 #[derive(Debug, Clone)]
 pub struct Set {
-    pub l_value: Value,
-    pub r_value: Value,
+    pub l_value: Operand,
+    pub r_value: Operand,
 }
 
 #[derive(Debug, Clone)]
-pub enum Value {
+/// Where an instruction reads or writes a value: a register, a variable, or
+/// a value given directly.
+pub enum Operand {
     Register(Register),
     Var(String),
-    Primitive(RcPrimitive),
+    Value(JsValue),
 }
 
 #[derive(Debug, Clone)]
 pub struct JumpIf {
     pub if_true: bool,
-    pub value: Value,
+    pub value: Operand,
     pub pos: JumpPos,
 }
 
@@ -179,7 +181,7 @@ impl Instruction {
         {
             let set = Set {
                 l_value: out.clone(),
-                r_value: Value::Primitive(v),
+                r_value: Operand::Value(v),
             };
             self.set(engine, scope, &set)?;
         }
@@ -203,7 +205,6 @@ impl Instruction {
     ) -> Result<Option<JumpPos>, JSError> {
         let value = engine
             .resolve_value(&jump.value, scope)?
-            .as_ref()
             .to_boolean();
         if value == jump.if_true {
             Ok(Some(jump.pos.clone()))
@@ -219,10 +220,10 @@ impl Instruction {
         scope: &Rc<Scope>,
         call: &Call,
     ) -> Result<Option<JumpPos>, JSError> {
-        if let Primitive::Function(func) = engine.resolve_value(&call.function, scope)?.as_ref() {
+        if let JsValue::Function(func) = &engine.resolve_value(&call.function, scope)? {
             if let Some(object) = &call.object {
                 let object = engine.resolve_value(object, scope)?;
-                object.as_ref().call(engine, scope, func, &call.args)?;
+                object.call(engine, scope, func, &call.args)?;
                 return Ok(None);
             }
         }
@@ -238,7 +239,7 @@ impl Instruction {
         let source = engine.resolve_value(&get.object, scope)?;
         let set = Set {
             l_value: get.output.clone(),
-            r_value: Value::Primitive(source.as_ref().get_prop(&get.attrib)?),
+            r_value: Operand::Value(source.get_prop(&get.attrib)?),
         };
         self.set(engine, scope, &set)?;
         // Use the object resolved above: re-resolving `get.object` would read
@@ -246,7 +247,7 @@ impl Instruction {
         // itself in AX.
         let set = Set {
             l_value: get.obj_output.clone(),
-            r_value: Value::Primitive(source),
+            r_value: Operand::Value(source),
         };
         self.set(engine, scope, &set)?;
         Ok(None)
@@ -260,9 +261,9 @@ impl Instruction {
     ) -> Result<Option<JumpPos>, JSError> {
         let dest = engine.resolve_value(&set.object, scope)?;
         match &set.input {
-            Value::Primitive(p) => dest.as_ref().set_prop(&set.attrib, p.clone()),
-            Value::Register(r) => dest.as_ref().set_prop(&set.attrib, engine.get_register(*r)),
-            Value::Var(v) => dest.as_ref().set_prop(&set.attrib, scope.get_variable(v)?),
+            Operand::Value(p) => dest.set_prop(&set.attrib, p.clone()),
+            Operand::Register(r) => dest.set_prop(&set.attrib, engine.get_register(*r)),
+            Operand::Var(v) => dest.set_prop(&set.attrib, scope.get_variable(v)?),
         }?;
         Ok(None)
     }
@@ -271,7 +272,7 @@ impl Instruction {
         if hoist.kind == VariableType::Any && scope.has_own_variable(&hoist.name) {
             return Ok(None);
         }
-        scope.add_variable(&hoist.name, hoist.kind.clone(), Primitive::Undefined.into())?;
+        scope.add_variable(&hoist.name, hoist.kind.clone(), JsValue::Undefined)?;
         Ok(None)
     }
 
@@ -304,18 +305,18 @@ impl Instruction {
         set: &Set,
     ) -> Result<Option<JumpPos>, JSError> {
         match (&set.l_value, &set.r_value) {
-            (Value::Var(v), Value::Primitive(p)) => scope.set_variable(v, p.clone())?,
-            (Value::Var(v), Value::Register(r)) => {
+            (Operand::Var(v), Operand::Value(p)) => scope.set_variable(v, p.clone())?,
+            (Operand::Var(v), Operand::Register(r)) => {
                 scope.set_variable(v, engine.get_register(*r))?
             }
-            (Value::Var(v1), Value::Var(v2)) => scope.set_variable(v1, scope.get_variable(v2)?)?,
-            (Value::Register(r1), Value::Register(r2)) => {
+            (Operand::Var(v1), Operand::Var(v2)) => scope.set_variable(v1, scope.get_variable(v2)?)?,
+            (Operand::Register(r1), Operand::Register(r2)) => {
                 engine.set_register(*r1, engine.get_register(*r2));
             }
-            (Value::Register(r), Value::Var(v)) => {
+            (Operand::Register(r), Operand::Var(v)) => {
                 engine.set_register(*r, scope.get_variable(v)?);
             }
-            (Value::Register(r), Value::Primitive(p)) => engine.set_register(*r, p.clone()),
+            (Operand::Register(r), Operand::Value(p)) => engine.set_register(*r, p.clone()),
             (_, _) => todo!(),
         }
         Ok(None)
@@ -369,13 +370,13 @@ impl Instruction {
     }
 }
 
-impl Value {
+impl Operand {
     fn do_add(
         &self,
         rhs: &Self,
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
-    ) -> Result<RcPrimitive, JSError> {
+    ) -> Result<JsValue, JSError> {
         let (p1, p2) = self.get_vars(rhs, engine, scope)?;
         Ok(p1 + p2)
     }
@@ -386,8 +387,8 @@ impl Value {
         rhs: &Self,
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
-        op: impl FnOnce(RcPrimitive, RcPrimitive) -> Result<RcPrimitive, JSError>,
-    ) -> Result<RcPrimitive, JSError> {
+        op: impl FnOnce(JsValue, JsValue) -> Result<JsValue, JSError>,
+    ) -> Result<JsValue, JSError> {
         let (p1, p2) = self.get_vars(rhs, engine, scope)?;
         op(p1, p2)
     }
@@ -397,27 +398,27 @@ impl Value {
         rhs: &Self,
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
-    ) -> Result<(RcPrimitive, RcPrimitive), JSError> {
+    ) -> Result<(JsValue, JsValue), JSError> {
         Ok((
             engine.resolve_value(self, scope)?,
             engine.resolve_value(rhs, scope)?,
         ))
     }
 
-    pub fn do_from(value: RcPrimitive) -> Self {
+    pub fn do_from(value: JsValue) -> Self {
         value.into()
     }
 }
 
-impl From<Register> for Value {
+impl From<Register> for Operand {
     fn from(value: Register) -> Self {
         Self::Register(value)
     }
 }
 
-impl From<usize> for Value {
+impl From<usize> for Operand {
     fn from(value: usize) -> Self {
-        Self::Primitive(Primitive::Number(value as f64).into())
+        Self::Value(JsValue::Number(value as f64))
     }
 }
 
@@ -442,15 +443,15 @@ mod tests {
     fn test_exec_set() {
         let mut engine = engine();
         let set = Instruction::Set(Set {
-            l_value: Value::Register(Register::AX),
-            r_value: RcPrimitive::from(1.0).into(),
+            l_value: Operand::Register(Register::AX),
+            r_value: JsValue::from(1.0).into(),
         });
         let scope = engine.scope.clone();
         set.exec(&mut engine, &scope).unwrap();
-        assert!(engine.get_register(Register::AX) == RcPrimitive::from(1.0));
+        assert!(engine.get_register(Register::AX) == JsValue::from(1.0));
         let set = Instruction::Set(Set {
-            l_value: Value::Var("test".into()),
-            r_value: RcPrimitive::from(2.0).into(),
+            l_value: Operand::Var("test".into()),
+            r_value: JsValue::from(2.0).into(),
         });
         assert!(
             matches!(
@@ -466,9 +467,9 @@ mod tests {
         })
         .exec(&mut engine, &scope)
         .unwrap();
-        assert!(scope.get_variable("test").unwrap() == RcPrimitive::from(1.0));
+        assert!(scope.get_variable("test").unwrap() == JsValue::from(1.0));
         set.exec(&mut engine, &scope).unwrap();
-        assert!(scope.get_variable("test").unwrap() == RcPrimitive::from(2.0));
+        assert!(scope.get_variable("test").unwrap() == JsValue::from(2.0));
     }
 
     #[test]
@@ -482,9 +483,9 @@ mod tests {
         })
         .exec(&mut engine, &scope)
         .unwrap();
-        assert!(scope.get_variable("c").unwrap() == RcPrimitive::from(1.0));
+        assert!(scope.get_variable("c").unwrap() == JsValue::from(1.0));
         let reassign = Instruction::Set(Set {
-            l_value: Value::Var("c".into()),
+            l_value: Operand::Var("c".into()),
             r_value: 2.0.into(),
         });
         assert!(matches!(
@@ -501,15 +502,17 @@ mod tests {
             .add_variable("x", crate::executor::scope::VariableType::Let, 1.0.into())
             .unwrap();
         engine.set_register(Register::AX, 10.0.into());
-        for value in [Value::Register(Register::AX), Value::Var("x".into())] {
-            Instruction::Push(Push { value }).exec(&mut engine, &scope).unwrap();
+        for value in [Operand::Register(Register::AX), Operand::Var("x".into())] {
+            Instruction::Push(Push { value })
+                .exec(&mut engine, &scope)
+                .unwrap();
         }
         // Change both sources after pushing.
         engine.set_register(Register::AX, 99.0.into());
         scope.set_variable("x", 99.0.into()).unwrap();
         for (expected, register) in [(1.0, Register::BX), (10.0, Register::CX)] {
             Instruction::Pop(Pop {
-                value: Some(Value::Register(register)),
+                value: Some(Operand::Register(register)),
             })
             .exec(&mut engine, &scope)
             .unwrap();
@@ -536,19 +539,19 @@ mod tests {
         let mut engine = engine();
         let scope = engine.scope.clone();
         let objprim =
-            ObjectPrimitive::new(BTreeMap::from([("prop1".into(), RcPrimitive::from(0.1))]));
-        let obj = RcPrimitive::from(Primitive::Object(Rc::new(objprim)));
+            ObjectPrimitive::new(BTreeMap::from([("prop1".into(), JsValue::from(0.1))]));
+        let obj = JsValue::Object(Rc::new(objprim));
         scope
             .add_variable("first", crate::executor::scope::VariableType::Any, obj)
             .unwrap();
         let get = Instruction::GetAttr(GetAttr {
             attrib: "prop1".into(),
-            object: Value::Var("first".into()),
-            output: Value::Register(Register::AX),
-            obj_output: Value::Register(Register::BX),
+            object: Operand::Var("first".into()),
+            output: Operand::Register(Register::AX),
+            obj_output: Operand::Register(Register::BX),
         });
         get.exec(&mut engine, &scope).unwrap();
-        assert!(engine.get_register(Register::AX) == RcPrimitive::from(0.1));
+        assert!(engine.get_register(Register::AX) == JsValue::from(0.1));
     }
 
     #[test]
@@ -557,9 +560,9 @@ mod tests {
         let scope = engine.scope.clone();
         let get = Instruction::GetAttr(GetAttr {
             attrib: "log".into(),
-            object: Value::Var("console".into()),
-            output: Value::Register(Register::AX),
-            obj_output: Value::Register(Register::BX),
+            object: Operand::Var("console".into()),
+            output: Operand::Register(Register::AX),
+            obj_output: Operand::Register(Register::BX),
         });
         get.exec(&mut engine, &scope).unwrap();
         println!("{engine}")
@@ -570,75 +573,75 @@ mod tests {
         let mut engine = engine();
         let scope = engine.scope.clone();
         let objprim = ObjectPrimitive::new(BTreeMap::new());
-        let obj = RcPrimitive::from(Primitive::Object(Rc::new(objprim)));
+        let obj = JsValue::Object(Rc::new(objprim));
         scope
             .add_variable("first", crate::executor::scope::VariableType::Any, obj)
             .unwrap();
         let get = Instruction::GetAttr(GetAttr {
             attrib: "prop1".into(),
-            object: Value::Var("first".into()),
-            output: Value::Register(Register::AX),
-            obj_output: Value::Register(Register::BX),
+            object: Operand::Var("first".into()),
+            output: Operand::Register(Register::AX),
+            obj_output: Operand::Register(Register::BX),
         });
         let res = get.exec(&mut engine, &scope);
         assert!(res.is_err());
         let set = Instruction::SetAttr(SetAttr {
-            object: Value::Var("first".into()),
+            object: Operand::Var("first".into()),
             attrib: "prop1".into(),
-            input: Value::Primitive(RcPrimitive::from(10.0)),
+            input: Operand::Value(JsValue::from(10.0)),
         });
         set.exec(&mut engine, &scope).unwrap();
         get.exec(&mut engine, &scope).unwrap();
-        assert!(engine.get_register(Register::AX) == RcPrimitive::from(10.0));
+        assert!(engine.get_register(Register::AX) == JsValue::from(10.0));
     }
 
     /// Run `left op right` as a `Binary` instruction and return the result.
     fn eval(
-        left: impl Into<RcPrimitive>,
+        left: impl Into<JsValue>,
         op: BinaryOp,
-        right: impl Into<RcPrimitive>,
-    ) -> Result<RcPrimitive, JSError> {
+        right: impl Into<JsValue>,
+    ) -> Result<JsValue, JSError> {
         let mut engine = engine();
         let scope = engine.scope.clone();
         Instruction::Binary(Binary {
-            left: Value::Primitive(left.into()),
+            left: Operand::Value(left.into()),
             op,
-            right: Value::Primitive(right.into()),
+            right: Operand::Value(right.into()),
             output: Some(Register::CX),
         })
         .exec(&mut engine, &scope)?;
         Ok(engine.get_register(Register::CX))
     }
 
-    fn num(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> f64 {
-        match eval(left, op, right).unwrap().as_ref() {
-            Primitive::Number(n) => *n,
+    fn num(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> f64 {
+        match &eval(left, op, right).unwrap() {
+            JsValue::Number(n) => *n,
             other => panic!("expected a number, got {other:?}"),
         }
     }
 
-    fn boolean(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> bool {
-        match eval(left, op, right).unwrap().as_ref() {
-            Primitive::Bool(b) => *b,
+    fn boolean(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> bool {
+        match &eval(left, op, right).unwrap() {
+            JsValue::Bool(b) => *b,
             other => panic!("expected a boolean, got {other:?}"),
         }
     }
 
-    fn big(n: i128) -> Primitive {
-        Primitive::BigInt(n)
+    fn big(n: i128) -> JsValue {
+        JsValue::BigInt(n)
     }
 
-    fn bigint(left: impl Into<RcPrimitive>, op: BinaryOp, right: impl Into<RcPrimitive>) -> i128 {
-        match eval(left, op, right).unwrap().as_ref() {
-            Primitive::BigInt(n) => *n,
+    fn bigint(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> i128 {
+        match &eval(left, op, right).unwrap() {
+            JsValue::BigInt(n) => *n,
             other => panic!("expected a BigInt, got {other:?}"),
         }
     }
 
     fn type_error(
-        left: impl Into<RcPrimitive>,
+        left: impl Into<JsValue>,
         op: BinaryOp,
-        right: impl Into<RcPrimitive>,
+        right: impl Into<JsValue>,
     ) -> String {
         match eval(left, op, right) {
             Err(JSError::TypeError(m)) => m,
@@ -647,9 +650,9 @@ mod tests {
     }
 
     fn range_error(
-        left: impl Into<RcPrimitive>,
+        left: impl Into<JsValue>,
         op: BinaryOp,
-        right: impl Into<RcPrimitive>,
+        right: impl Into<JsValue>,
     ) -> String {
         match eval(left, op, right) {
             Err(JSError::RangeError(m)) => m,
@@ -657,8 +660,8 @@ mod tests {
         }
     }
 
-    const UNDEFINED: Primitive = Primitive::Undefined;
-    const NULL: Primitive = Primitive::Null;
+    const UNDEFINED: JsValue = JsValue::Undefined;
+    const NULL: JsValue = JsValue::Null;
 
     #[test]
     fn test_sub() {
@@ -865,12 +868,12 @@ mod tests {
     fn test_objects_compare_by_identity() {
         let mut engine = engine();
         let scope = engine.scope.clone();
-        let object = RcPrimitive::from(Primitive::Object(Rc::new(ObjectPrimitive::new(
+        let object = JsValue::Object(Rc::new(ObjectPrimitive::new(
             Default::default(),
-        ))));
-        let lookalike = RcPrimitive::from(Primitive::Object(Rc::new(ObjectPrimitive::new(
+        )));
+        let lookalike = JsValue::Object(Rc::new(ObjectPrimitive::new(
             Default::default(),
-        ))));
+        )));
         let same = Instruction::Binary(Binary {
             left: object.clone().into(),
             op: BinaryOp::StrictEq,
@@ -888,7 +891,7 @@ mod tests {
         different.exec(&mut engine, &scope).unwrap();
         assert_eq!(engine.get_register(Register::AX), false.into());
         assert!(boolean(
-            Primitive::Object(Rc::new(ObjectPrimitive::new(Default::default()))),
+            JsValue::Object(Rc::new(ObjectPrimitive::new(Default::default()))),
             BinaryOp::Eq,
             "[object Object]"
         ));
@@ -914,11 +917,11 @@ mod tests {
     #[test]
     fn test_in() {
         let props = [
-            ("a".to_string(), RcPrimitive::from(1.0)),
+            ("a".to_string(), JsValue::from(1.0)),
             ("0".to_string(), 2.0.into()),
         ];
         let object = || {
-            Primitive::Object(Rc::new(ObjectPrimitive::new(
+            JsValue::Object(Rc::new(ObjectPrimitive::new(
                 props.clone().into_iter().collect(),
             )))
         };
@@ -943,7 +946,7 @@ mod tests {
         assert!(!boolean(
             1.0,
             BinaryOp::InstanceOf,
-            Primitive::Function("test".into())
+            JsValue::Function("test".into())
         ));
         assert_eq!(
             type_error(1.0, BinaryOp::InstanceOf, 1.0),
@@ -953,7 +956,7 @@ mod tests {
             type_error(
                 1.0,
                 BinaryOp::InstanceOf,
-                Primitive::Object(Rc::new(ObjectPrimitive::new(Default::default())))
+                JsValue::Object(Rc::new(ObjectPrimitive::new(Default::default())))
             ),
             "Right-hand side of 'instanceof' is not callable"
         );
@@ -968,9 +971,9 @@ mod tests {
             .unwrap();
         engine.set_register(Register::BX, 4.0.into());
         Instruction::Binary(Binary {
-            left: Value::Var("x".into()),
+            left: Operand::Var("x".into()),
             op: BinaryOp::Sub,
-            right: Value::Register(Register::BX),
+            right: Operand::Register(Register::BX),
             output: None,
         })
         .exec(&mut engine, &scope)
@@ -982,7 +985,7 @@ mod tests {
         );
 
         let missing = Instruction::Binary(Binary {
-            left: Value::Var("missing".into()),
+            left: Operand::Var("missing".into()),
             op: BinaryOp::Mul,
             right: 2.0.into(),
             output: Some(Register::CX),
@@ -997,11 +1000,11 @@ mod tests {
             .add_variable(
                 "unset",
                 crate::executor::scope::VariableType::Let,
-                RcPrimitive::undefined(),
+                JsValue::Undefined,
             )
             .unwrap();
         Instruction::Binary(Binary {
-            left: Value::Var("unset".into()),
+            left: Operand::Var("unset".into()),
             op: BinaryOp::Mul,
             right: 2.0.into(),
             output: Some(Register::CX),
@@ -1009,7 +1012,7 @@ mod tests {
         .exec(&mut engine, &scope)
         .unwrap();
         assert!(
-            matches!(engine.get_register(Register::CX).as_ref(), Primitive::Number(n) if n.is_nan()),
+            matches!(&engine.get_register(Register::CX), JsValue::Number(n) if n.is_nan()),
             "undefined * 2 is NaN"
         );
     }
