@@ -251,7 +251,7 @@ impl JsValue {
     pub fn to_boolean(&self) -> bool {
         match self {
             JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
-            JsValue::BigInt(n) => *n != 0,
+            JsValue::BigInt(n) => **n != 0,
             JsValue::Str(s) => !s.is_empty(),
             JsValue::Bool(b) => *b,
             JsValue::Null | JsValue::Undefined => false,
@@ -307,7 +307,7 @@ impl JsValue {
     /// ToNumber.
     fn to_numeric(&self) -> Result<Numeric, JSError> {
         match self {
-            JsValue::BigInt(n) => Ok(Numeric::BigInt(*n)),
+            JsValue::BigInt(n) => Ok(Numeric::BigInt(**n)),
             other => other.to_number().map(Numeric::Number),
         }
     }
@@ -323,7 +323,7 @@ fn numeric_op(
 ) -> Result<JsValue, JSError> {
     match (lhs.to_numeric()?, rhs.to_numeric()?) {
         (Numeric::Number(a), Numeric::Number(b)) => Ok(JsValue::Number(number(a, b))),
-        (Numeric::BigInt(a), Numeric::BigInt(b)) => Ok(JsValue::BigInt(bigint(a, b)?)),
+        (Numeric::BigInt(a), Numeric::BigInt(b)) => Ok(JsValue::bigint(bigint(a, b)?)),
         _ => Err(mix_error()),
     }
 }
@@ -339,10 +339,10 @@ fn less_than(a: &JsValue, b: &JsValue) -> Result<Option<bool>, JSError> {
             return Ok(Some(x.encode_utf16().lt(y.encode_utf16())));
         }
         (JsValue::BigInt(x), JsValue::Str(y)) => {
-            return Ok(string_to_bigint(y).map(|y| *x < y));
+            return Ok(string_to_bigint(y).map(|y| **x < y));
         }
         (JsValue::Str(x), JsValue::BigInt(y)) => {
-            return Ok(string_to_bigint(x).map(|x| x < *y));
+            return Ok(string_to_bigint(x).map(|x| x < **y));
         }
         _ => {}
     }
@@ -483,7 +483,7 @@ impl JsValue {
             (P::Null | P::Undefined, _) | (_, P::Null | P::Undefined) => false,
             (P::Number(n), P::Str(s)) | (P::Str(s), P::Number(n)) => *n == string_to_number(s),
             (P::BigInt(n), P::Str(s)) | (P::Str(s), P::BigInt(n)) => {
-                string_to_bigint(s) == Some(*n)
+                string_to_bigint(s) == Some(**n)
             }
             (P::Bool(b), _) => JsValue::from(if *b { 1.0 } else { 0.0 }).loose_equals(rhs),
             (_, P::Bool(b)) => self.loose_equals(&JsValue::from(if *b { 1.0 } else { 0.0 })),
@@ -495,7 +495,7 @@ impl JsValue {
                 self.loose_equals(&y.to_primitive())
             }
             (P::BigInt(a), P::Number(b)) | (P::Number(b), P::BigInt(a)) => {
-                bigint_cmp_number(*a, *b) == Some(Ordering::Equal)
+                bigint_cmp_number(**a, *b) == Some(Ordering::Equal)
             }
             _ => false,
         }
@@ -514,6 +514,66 @@ impl JsValue {
     /// `self ?? rhs`: `self` unless it's `null`/`undefined`.
     pub fn nullish_or(self, rhs: Self) -> Self {
         if self.is_nullish() { rhs } else { self }
+    }
+
+    /// `+self`: ToNumber, so a BigInt is a TypeError.
+    pub fn unary_plus(&self) -> Result<Self, JSError> {
+        Ok(JsValue::Number(self.to_number()?))
+    }
+
+    /// `-self`.
+    pub fn negate(&self) -> Result<Self, JSError> {
+        Ok(match self.to_numeric()? {
+            Numeric::Number(n) => JsValue::Number(-n),
+            Numeric::BigInt(n) => JsValue::bigint(n.checked_neg().ok_or_else(overflow)?),
+        })
+    }
+
+    /// `~self`: bitwise not of the 32-bit integer value.
+    pub fn bit_not(&self) -> Result<Self, JSError> {
+        Ok(match self.to_numeric()? {
+            Numeric::Number(n) => JsValue::Number(f64::from(!to_int32(n))),
+            Numeric::BigInt(n) => JsValue::bigint(!n),
+        })
+    }
+
+    /// `!self`.
+    pub fn logical_not(&self) -> Self {
+        JsValue::Bool(!self.to_boolean())
+    }
+
+    /// `typeof self`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            JsValue::Number(_) => "number",
+            JsValue::BigInt(_) => "bigint",
+            JsValue::Str(_) => "string",
+            JsValue::Bool(_) => "boolean",
+            JsValue::Undefined => "undefined",
+            JsValue::Symbol(_) => "symbol",
+            JsValue::Function(_) => "function",
+            JsValue::Null | JsValue::Object(_) => "object",
+        }
+    }
+
+    /// ToNumeric as a value: what `x++` evaluates to, the old value as a
+    /// Number or BigInt.
+    pub fn to_numeric_value(&self) -> Result<Self, JSError> {
+        Ok(match self.to_numeric()? {
+            Numeric::Number(n) => JsValue::Number(n),
+            Numeric::BigInt(n) => JsValue::bigint(n),
+        })
+    }
+
+    /// The value `++` (`by` = 1) or `--` (`by` = -1) stores: ToNumeric, then
+    /// one more or less, keeping a BigInt a BigInt.
+    pub fn step(&self, by: i8) -> Result<Self, JSError> {
+        Ok(match self.to_numeric()? {
+            Numeric::Number(n) => JsValue::Number(n + f64::from(by)),
+            Numeric::BigInt(n) => {
+                JsValue::bigint(n.checked_add(i128::from(by)).ok_or_else(overflow)?)
+            }
+        })
     }
 
     /// `self in rhs`: whether the object `rhs` has a property named `self`.
@@ -556,6 +616,7 @@ impl JsValue {
 #[cfg(test)]
 mod tests {
     use super::{number_to_string, string_to_bigint, string_to_number};
+    use crate::{error::JSError, primitive::JsValue};
 
     #[test]
     fn string_to_number_follows_js() {
@@ -612,5 +673,23 @@ mod tests {
         ] {
             assert_eq!(number_to_string(n), s, "{n}");
         }
+    }
+
+    #[test]
+    fn unary_ops_keep_bigints_bigints() {
+        // The parser has no BigInt literals yet, so these aren't reachable
+        // from JS.
+        let b = JsValue::bigint(5);
+        assert_eq!(b.negate().unwrap(), JsValue::bigint(-5));
+        assert_eq!(b.bit_not().unwrap(), JsValue::bigint(-6));
+        assert_eq!(b.step(1).unwrap(), JsValue::bigint(6));
+        assert_eq!(b.step(-1).unwrap(), JsValue::bigint(4));
+        assert_eq!(b.to_numeric_value().unwrap(), b);
+        assert_eq!(b.type_name(), "bigint");
+        assert!(matches!(b.unary_plus(), Err(JSError::TypeError(_))));
+        assert!(matches!(
+            JsValue::bigint(i128::MIN).negate(),
+            Err(JSError::RangeError(_))
+        ));
     }
 }

@@ -1,8 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
     rc::{Rc, Weak},
 };
+
+use rustc_hash::FxHashMap;
 
 use rjs_core::statement::DeclKind;
 
@@ -17,7 +18,9 @@ use crate::{
 /// left it.
 #[derive(Debug, Default)]
 pub struct Scope {
-    pub vars: RefCell<HashMap<String, Rc<RefCell<Variable>>>>,
+    /// Keyed with FxHash: much faster than the default SipHash for short
+    /// names, and hash-flooding resistance doesn't matter here.
+    pub vars: RefCell<FxHashMap<String, Rc<RefCell<Variable>>>>,
     pub parent: Option<Weak<Scope>>,
 }
 
@@ -79,7 +82,7 @@ impl Variable {
 impl Scope {
     pub fn create_default() -> Rc<Self> {
         let this = Rc::new(Self {
-            vars: RefCell::new(HashMap::new()),
+            vars: RefCell::new(FxHashMap::default()),
             parent: None,
         });
         let console = JsValue::Object(Rc::new(Console::new()));

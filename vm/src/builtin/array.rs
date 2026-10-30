@@ -219,9 +219,7 @@ impl Array {
     ) -> Result<(), JSError> {
         let count = match args.len() {
             0 => 0,
-            1 => engine
-                .resolve_value(&args[0], scope)?
-                .to_number()? as usize,
+            1 => engine.resolve_value(&args[0], scope)?.to_number()? as usize,
             _ => {
                 return Err(JSError::UnknownError(format!(
                     "Too many arguments {}",
@@ -456,6 +454,24 @@ impl Array {
         Ok(Self::create(items))
     }
 
+    /// Element `i`, or `undefined` past the end.
+    pub fn get_index(&self, i: usize) -> JsValue {
+        self.items
+            .borrow()
+            .get(i)
+            .cloned()
+            .unwrap_or(JsValue::Undefined)
+    }
+
+    /// Sets element `i`, padding with `undefined` when `i` is past the end.
+    pub fn set_index(&self, i: usize, value: JsValue) {
+        let mut items = self.items.borrow_mut();
+        if i >= items.len() {
+            items.resize(i + 1, JsValue::Undefined);
+        }
+        items[i] = value;
+    }
+
     /// Sets `length`: truncates, or pads with `undefined`.
     fn set_length(&self, value: &JsValue) -> Result<(), JSError> {
         let n = value.to_number()?;
@@ -496,7 +512,11 @@ fn relative_index(value: &JsValue, len: usize, default: usize) -> Result<usize, 
     }
     let n = to_integer(value)?;
     let len = len as f64;
-    Ok(if n < 0.0 { (len + n).max(0.0) } else { n.min(len) } as usize)
+    Ok(if n < 0.0 {
+        (len + n).max(0.0)
+    } else {
+        n.min(len)
+    } as usize)
 }
 
 fn index_result(index: Option<usize>) -> JsValue {
@@ -551,10 +571,7 @@ fn sort_items(items: Vec<JsValue>, args: &[JsValue]) -> Result<Vec<JsValue>, JSE
 
 /// Splices `items` in place per `splice(start, deleteCount, ...insert)`,
 /// returning the removed elements.
-fn splice_items(
-    items: &mut Vec<JsValue>,
-    args: &[JsValue],
-) -> Result<Vec<JsValue>, JSError> {
+fn splice_items(items: &mut Vec<JsValue>, args: &[JsValue]) -> Result<Vec<JsValue>, JSError> {
     let len = items.len();
     let start = relative_index(&arg(args, 0), len, 0)?;
     let delete = match args.len() {
@@ -618,11 +635,7 @@ impl Object for Array {
             return self.set_length(&value);
         }
         if let Some(i) = array_index(prop) {
-            let mut items = self.items.borrow_mut();
-            if i >= items.len() {
-                items.resize(i + 1, JsValue::Undefined);
-            }
-            items[i] = value;
+            self.set_index(i, value);
             return Ok(());
         }
         Err(JSError::NotSupported(format!(
@@ -651,7 +664,7 @@ impl Object for Array {
         method: &Func,
         args: &[Operand],
     ) -> Result<(), JSError> {
-        if let JsValue::Function(func) = &self.get_prop(&method.0)? {
+        if let JsValue::Function(func) = &self.get_prop(&method.name)? {
             self.call_func(func, engine, scope, args)
         } else {
             Err(JSError::RefereneError(method.to_string()))
@@ -666,11 +679,7 @@ impl Object for Array {
 #[cfg(test)]
 mod tests {
     use super::Array;
-    use crate::{
-        error::JSError,
-        executor::engine::JSEngine,
-        primitive::{JsValue},
-    };
+    use crate::{error::JSError, executor::engine::JSEngine, primitive::JsValue};
 
     /// Run `src` and return variable `s` as a string.
     fn eval(src: &str) -> String {
@@ -687,7 +696,10 @@ mod tests {
     #[test]
     fn test_literal_and_to_string() {
         assert_eq!(eval("let s = [1, 2, 3].toString()"), "1,2,3");
-        assert_eq!(eval("let x = 1; let a = [x, 1 + 1, 2 * 2, 'z']; x = 9; let s = a.toString()"), "1,2,4,z");
+        assert_eq!(
+            eval("let x = 1; let a = [x, 1 + 1, 2 * 2, 'z']; x = 9; let s = a.toString()"),
+            "1,2,4,z"
+        );
         assert_eq!(eval("let s = [].toString()"), "");
         assert_eq!(eval("let s = [1, [2, [3, 4]], 5].toString()"), "1,2,3,4,5");
     }
@@ -704,23 +716,41 @@ mod tests {
         assert_eq!(eval("let s = [1, 2, 3].join()"), "1,2,3");
         assert_eq!(eval("let s = [1, 2, 3].join(' - ')"), "1 - 2 - 3");
         assert_eq!(eval("let s = [1, 2, 3].join('')"), "123");
-        assert_eq!(eval("let s = ['a', null, 'b'].join('|')"), "a||b", "null joins as empty");
+        assert_eq!(
+            eval("let s = ['a', null, 'b'].join('|')"),
+            "a||b",
+            "null joins as empty"
+        );
         assert_eq!(eval("let s = [true, 1.5, 0 / 0].join()"), "true,1.5,NaN");
-        assert_eq!(eval("let a = [1, 2]; a.push(a); let s = a.join('-')"), "1-2-", "a cycle joins as empty");
+        assert_eq!(
+            eval("let a = [1, 2]; a.push(a); let s = a.join('-')"),
+            "1-2-",
+            "a cycle joins as empty"
+        );
     }
 
     #[test]
     fn test_push_pop_shift_unshift() {
-        assert_eq!(eval("let a = [1]; let s = a.push(2, 3)"), "3", "push returns the new length");
+        assert_eq!(
+            eval("let a = [1]; let s = a.push(2, 3)"),
+            "3",
+            "push returns the new length"
+        );
         assert_eq!(eval("let a = [1]; a.push(2, 3); let s = a.join()"), "1,2,3");
         assert_eq!(eval("let a = [1, 2, 3]; let s = a.pop()"), "3");
         assert_eq!(eval("let a = [1, 2, 3]; a.pop(); let s = a.join()"), "1,2");
         assert_eq!(eval("let a = []; let s = a.pop()"), "undefined");
         assert_eq!(eval("let a = [1, 2, 3]; let s = a.shift()"), "1");
-        assert_eq!(eval("let a = [1, 2, 3]; a.shift(); let s = a.join()"), "2,3");
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.shift(); let s = a.join()"),
+            "2,3"
+        );
         assert_eq!(eval("let a = []; let s = a.shift()"), "undefined");
         assert_eq!(eval("let a = [3]; let s = a.unshift(1, 2)"), "3");
-        assert_eq!(eval("let a = [3]; a.unshift(1, 2); let s = a.join()"), "1,2,3");
+        assert_eq!(
+            eval("let a = [3]; a.unshift(1, 2); let s = a.join()"),
+            "1,2,3"
+        );
     }
 
     #[test]
@@ -733,17 +763,40 @@ mod tests {
 
     #[test]
     fn test_reverse_and_to_reversed() {
-        assert_eq!(eval("let a = [1, 2, 3]; a.reverse(); let s = a.join()"), "3,2,1");
-        assert_eq!(eval("let a = [1, 2, 3]; let s = a.toReversed().join() + ' ' + a.join()"), "3,2,1 1,2,3");
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.reverse(); let s = a.join()"),
+            "3,2,1"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3]; let s = a.toReversed().join() + ' ' + a.join()"),
+            "3,2,1 1,2,3"
+        );
     }
 
     #[test]
     fn test_sort() {
-        assert_eq!(eval("let a = [3, 1, 2]; a.sort(); let s = a.join()"), "1,2,3");
-        assert_eq!(eval("let a = [10, 9, 1, 100]; a.sort(); let s = a.join()"), "1,10,100,9", "sorted as strings");
-        assert_eq!(eval("let a = ['b', 'B', 'a', 'A']; a.sort(); let s = a.join()"), "A,B,a,b");
-        assert_eq!(eval("let a = [3, null, 1]; a.sort(); let s = a.join('|')"), "1|3|", "null sorts as 'null'");
-        assert_eq!(eval("let a = [3, 1, 2]; let s = a.toSorted().join() + ' ' + a.join()"), "1,2,3 3,1,2");
+        assert_eq!(
+            eval("let a = [3, 1, 2]; a.sort(); let s = a.join()"),
+            "1,2,3"
+        );
+        assert_eq!(
+            eval("let a = [10, 9, 1, 100]; a.sort(); let s = a.join()"),
+            "1,10,100,9",
+            "sorted as strings"
+        );
+        assert_eq!(
+            eval("let a = ['b', 'B', 'a', 'A']; a.sort(); let s = a.join()"),
+            "A,B,a,b"
+        );
+        assert_eq!(
+            eval("let a = [3, null, 1]; a.sort(); let s = a.join('|')"),
+            "1|3|",
+            "null sorts as 'null'"
+        );
+        assert_eq!(
+            eval("let a = [3, 1, 2]; let s = a.toSorted().join() + ' ' + a.join()"),
+            "1,2,3 3,1,2"
+        );
         assert!(matches!(exec_err("[1].sort(1)"), JSError::TypeError(_)));
     }
 
@@ -755,42 +808,98 @@ mod tests {
         assert_eq!(eval("let s = [1, 2, 3, 4].slice(1, 0 - 1).join()"), "2,3");
         assert_eq!(eval("let s = [1, 2, 3, 4].slice(3, 1).join()"), "");
         assert_eq!(eval("let s = [1, 2, 3, 4].slice(10).join()"), "");
-        assert_eq!(eval("let a = [1, 2]; let s = a.slice() === a"), "false", "a copy");
+        assert_eq!(
+            eval("let a = [1, 2]; let s = a.slice() === a"),
+            "false",
+            "a copy"
+        );
     }
 
     #[test]
     fn test_splice_and_to_spliced() {
-        assert_eq!(eval("let a = [1, 2, 3, 4]; let s = a.splice(1, 2).join()"), "2,3", "returns the removed elements");
-        assert_eq!(eval("let a = [1, 2, 3, 4]; a.splice(1, 2); let s = a.join()"), "1,4");
-        assert_eq!(eval("let a = [1, 2, 3, 4]; a.splice(1, 1, 'x', 'y'); let s = a.join()"), "1,x,y,3,4");
-        assert_eq!(eval("let a = [1, 2, 3, 4]; a.splice(2); let s = a.join()"), "1,2", "no count removes the rest");
-        assert_eq!(eval("let a = [1, 2, 3]; a.splice(0 - 1, 1); let s = a.join()"), "1,2");
-        assert_eq!(eval("let a = [1, 2, 3]; a.splice(1, 0, 9); let s = a.join()"), "1,9,2,3");
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; let s = a.splice(1, 2).join()"),
+            "2,3",
+            "returns the removed elements"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; a.splice(1, 2); let s = a.join()"),
+            "1,4"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; a.splice(1, 1, 'x', 'y'); let s = a.join()"),
+            "1,x,y,3,4"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; a.splice(2); let s = a.join()"),
+            "1,2",
+            "no count removes the rest"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.splice(0 - 1, 1); let s = a.join()"),
+            "1,2"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.splice(1, 0, 9); let s = a.join()"),
+            "1,9,2,3"
+        );
         assert_eq!(eval("let a = [1, 2, 3]; let s = a.splice().length"), "0");
-        assert_eq!(eval("let a = [1, 2, 3]; let s = a.toSpliced(1, 1, 'x').join() + ' ' + a.join()"), "1,x,3 1,2,3");
+        assert_eq!(
+            eval("let a = [1, 2, 3]; let s = a.toSpliced(1, 1, 'x').join() + ' ' + a.join()"),
+            "1,x,3 1,2,3"
+        );
     }
 
     #[test]
     fn test_fill_and_copy_within() {
-        assert_eq!(eval("let a = [1, 2, 3]; a.fill(0); let s = a.join()"), "0,0,0");
-        assert_eq!(eval("let a = [1, 2, 3, 4]; a.fill(0, 1, 3); let s = a.join()"), "1,0,0,4");
-        assert_eq!(eval("let a = [1, 2, 3, 4]; a.fill(0, 0 - 1); let s = a.join()"), "1,2,3,0");
-        assert_eq!(eval("let a = [1, 2, 3, 4, 5]; a.copyWithin(0, 3); let s = a.join()"), "4,5,3,4,5");
-        assert_eq!(eval("let a = [1, 2, 3, 4, 5]; a.copyWithin(1, 0, 2); let s = a.join()"), "1,1,2,4,5");
-        assert_eq!(eval("let a = [1, 2, 3]; a.copyWithin(2, 0); let s = a.join()"), "1,2,1", "length is unchanged");
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.fill(0); let s = a.join()"),
+            "0,0,0"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; a.fill(0, 1, 3); let s = a.join()"),
+            "1,0,0,4"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4]; a.fill(0, 0 - 1); let s = a.join()"),
+            "1,2,3,0"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4, 5]; a.copyWithin(0, 3); let s = a.join()"),
+            "4,5,3,4,5"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3, 4, 5]; a.copyWithin(1, 0, 2); let s = a.join()"),
+            "1,1,2,4,5"
+        );
+        assert_eq!(
+            eval("let a = [1, 2, 3]; a.copyWithin(2, 0); let s = a.join()"),
+            "1,2,1",
+            "length is unchanged"
+        );
     }
 
     #[test]
     fn test_concat() {
-        assert_eq!(eval("let s = [1].concat([2, 3], 4, [[5]]).join('|')"), "1|2|3|4|5");
-        assert_eq!(eval("let a = [1]; let b = a.concat(); let s = (b === a) + ' ' + b.join()"), "false 1");
+        assert_eq!(
+            eval("let s = [1].concat([2, 3], 4, [[5]]).join('|')"),
+            "1|2|3|4|5"
+        );
+        assert_eq!(
+            eval("let a = [1]; let b = a.concat(); let s = (b === a) + ' ' + b.join()"),
+            "false 1"
+        );
     }
 
     #[test]
     fn test_flat() {
         assert_eq!(eval("let s = [1, [2, [3, [4]]]].flat().length"), "3");
         assert_eq!(eval("let s = [1, [2, [3, [4]]]].flat(2).length"), "4");
-        assert_eq!(eval("let s = [1, [2, [3, [4]]]].flat(1 / 0).length"), "4", "Infinity flattens everything");
+        assert_eq!(
+            eval("let s = [1, [2, [3, [4]]]].flat(1 / 0).length"),
+            "4",
+            "Infinity flattens everything"
+        );
         assert_eq!(eval("let s = [1, [2]].flat(0).length"), "2");
     }
 
@@ -799,16 +908,32 @@ mod tests {
         assert_eq!(eval("let s = [1, 2, 3, 2].indexOf(2)"), "1");
         assert_eq!(eval("let s = [1, 2, 3, 2].indexOf(2, 2)"), "3");
         assert_eq!(eval("let s = [1, 2, 3].indexOf(4)"), "-1");
-        assert_eq!(eval("let s = [1, 2, 3].indexOf('2')"), "-1", "strict equality");
+        assert_eq!(
+            eval("let s = [1, 2, 3].indexOf('2')"),
+            "-1",
+            "strict equality"
+        );
         assert_eq!(eval("let s = [1, 2, 3, 2].lastIndexOf(2)"), "3");
         assert_eq!(eval("let s = [1, 2, 3, 2].lastIndexOf(2, 2)"), "1");
         assert_eq!(eval("let s = [1, 2, 3, 2].lastIndexOf(2, 0 - 2)"), "1");
         assert_eq!(eval("let s = [].lastIndexOf(1)"), "-1");
         assert_eq!(eval("let s = [1, 2, 3].includes(2)"), "true");
         assert_eq!(eval("let s = [1, 2, 3].includes(2, 2)"), "false");
-        assert_eq!(eval("let s = [0 / 0].includes(0 / 0)"), "true", "includes finds NaN");
-        assert_eq!(eval("let s = [0 / 0].indexOf(0 / 0)"), "-1", "indexOf never finds NaN");
-        assert_eq!(eval("let a = [1]; let b = [a]; let s = b.indexOf(a)"), "0", "objects by identity");
+        assert_eq!(
+            eval("let s = [0 / 0].includes(0 / 0)"),
+            "true",
+            "includes finds NaN"
+        );
+        assert_eq!(
+            eval("let s = [0 / 0].indexOf(0 / 0)"),
+            "-1",
+            "indexOf never finds NaN"
+        );
+        assert_eq!(
+            eval("let a = [1]; let b = [a]; let s = b.indexOf(a)"),
+            "0",
+            "objects by identity"
+        );
         assert_eq!(eval("let b = [[1]]; let s = b.indexOf([1])"), "-1");
     }
 
@@ -817,7 +942,10 @@ mod tests {
         assert_eq!(eval("let s = [1, 2, 3].at(0)"), "1");
         assert_eq!(eval("let s = [1, 2, 3].at(0 - 1)"), "3");
         assert_eq!(eval("let s = [1, 2, 3].at(5)"), "undefined");
-        assert_eq!(eval("let a = [1, 2, 3]; let s = a.with(1, 'x').join() + ' ' + a.join()"), "1,x,3 1,2,3");
+        assert_eq!(
+            eval("let a = [1, 2, 3]; let s = a.with(1, 'x').join() + ' ' + a.join()"),
+            "1,x,3 1,2,3"
+        );
         assert_eq!(eval("let s = [1, 2, 3].with(0 - 1, 'x').join()"), "1,2,x");
         assert!(matches!(exec_err("[1].with(5, 0)"), JSError::RangeError(_)));
     }
@@ -828,19 +956,33 @@ mod tests {
         assert_eq!(eval("let s = Array.isArray('abc')"), "false");
         assert_eq!(eval("let s = Array.of(1, 'a', true).join()"), "1,a,true");
         assert_eq!(eval("let s = Array.from('abc').join('-')"), "a-b-c");
-        assert_eq!(eval("let a = [1, 2]; let b = Array.from(a); let s = (b === a) + ' ' + b.join()"), "false 1,2");
+        assert_eq!(
+            eval("let a = [1, 2]; let b = Array.from(a); let s = (b === a) + ' ' + b.join()"),
+            "false 1,2"
+        );
         assert_eq!(eval("let s = Array.from(5).length"), "0");
-        assert!(matches!(exec_err("Array.from(null)"), JSError::TypeError(_)));
+        assert!(matches!(
+            exec_err("Array.from(null)"),
+            JSError::TypeError(_)
+        ));
     }
 
     #[test]
     fn test_callback_and_iterator_methods_are_reported() {
-        for method in ["map", "filter", "forEach", "reduce", "find", "some", "every", "flatMap"] {
+        for method in [
+            "map", "filter", "forEach", "reduce", "find", "some", "every", "flatMap",
+        ] {
             let err = exec_err(&format!("[1].{method}(1)"));
             assert!(matches!(err, JSError::NotSupported(_)), "{method}: {err}");
         }
         for method in ["keys", "values", "entries"] {
-            assert!(matches!(exec_err(&format!("[1].{method}()")), JSError::NotSupported(_)), "{method}");
+            assert!(
+                matches!(
+                    exec_err(&format!("[1].{method}()")),
+                    JSError::NotSupported(_)
+                ),
+                "{method}"
+            );
         }
     }
 
@@ -855,7 +997,11 @@ mod tests {
         assert!(object.has_prop("2") && !object.has_prop("3") && object.has_prop("push"));
         object.set_prop("4", "x".into()).unwrap();
         assert_eq!(object.get_prop("length").unwrap(), 5.0.into());
-        assert_eq!(object.get_prop("3").unwrap(), JsValue::Undefined, "the gap is filled");
+        assert_eq!(
+            object.get_prop("3").unwrap(),
+            JsValue::Undefined,
+            "the gap is filled"
+        );
         object.set_prop("length", 2.0.into()).unwrap();
         assert_eq!(object.as_array().unwrap().join_with(",").unwrap(), "1,2");
         assert!(matches!(

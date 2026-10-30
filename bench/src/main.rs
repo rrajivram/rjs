@@ -108,7 +108,8 @@ impl Engine {
 /// The result for one program, size and engine.
 struct Row {
     benchmark: String,
-    size: usize,
+    /// `None` for a fixed program.
+    size: Option<usize>,
     engine: &'static str,
     outcome: Result<Sample, String>,
     output: &'static str,
@@ -218,8 +219,8 @@ fn run(opts: &Options) -> Result<(), String> {
     let mut rows = vec![];
     for template in &templates {
         println!("{}: {}", template.name, template.description);
-        for &size in &opts.sizes {
-            let file = out_dir.join(format!("{}-{size}.js", template.name));
+        for size in template.sizes(&opts.sizes) {
+            let file = out_dir.join(template.file_name(size));
             fs::write(&file, template.expand(size)).map_err(|e| e.to_string())?;
             let checks = if opts.check {
                 check_outputs(&engines, &file)
@@ -300,9 +301,11 @@ fn check_outputs(engines: &[Engine], file: &Path) -> Vec<Result<&'static str, St
         .collect()
 }
 
+/// Ignores trailing whitespace, and the VM's per-instruction statistics line.
 fn normalize(output: &str) -> String {
     output
         .lines()
+        .filter(|line| !line.starts_with("[Statistics {"))
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
@@ -331,6 +334,11 @@ fn version(program: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// A size for display: `-` for a fixed program.
+fn size_label(size: Option<usize>) -> String {
+    size.map_or("-".into(), |n| n.to_string())
+}
+
 fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
@@ -347,7 +355,7 @@ fn print_header() {
 }
 
 fn print_row(row: &Row, baseline: &Sample) {
-    let lead = format!("{:<18} {:>8} {:<15}", "", row.size, row.engine);
+    let lead = format!("{:<18} {:>8} {:<15}", "", size_label(row.size), row.engine);
     match &row.outcome {
         Ok(s) => println!(
             "{lead} {:>9.1} {:>11.1} {:>9.1} {:>9.1} {:>11.1}  {}",
@@ -372,7 +380,7 @@ fn csv(rows: &[(Row, Sample)]) -> String {
                 out,
                 "{},{},{},{:.3},{:.3},{:.3},{},{},{},",
                 row.benchmark,
-                row.size,
+                row.size.map_or(String::new(), |n| n.to_string()),
                 row.engine,
                 ms(s.wall),
                 ms(s.wall.saturating_sub(baseline.wall)),
@@ -385,7 +393,7 @@ fn csv(rows: &[(Row, Sample)]) -> String {
                 out,
                 "{},{},{},,,,,,{},\"{}\"",
                 row.benchmark,
-                row.size,
+                row.size.map_or(String::new(), |n| n.to_string()),
                 row.engine,
                 row.output,
                 e.replace('"', "\"\"")

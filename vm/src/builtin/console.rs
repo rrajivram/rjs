@@ -101,7 +101,7 @@ mod tests {
             ob.call(
                 &mut engine,
                 &scope,
-                &Func("warn".into()),
+                &Func::from("warn"),
                 &[JsValue::from("testing").into()],
             )
             .unwrap();

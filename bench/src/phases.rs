@@ -17,7 +17,7 @@
 
 use std::{collections::HashMap, fmt::Write as _, fs, path::Path};
 
-use crate::{Engine, Options, check_outputs, mb, program::Template};
+use crate::{Engine, Options, check_outputs, mb, program::Template, size_label};
 
 /// One engine's cost for one program, per phase.
 #[derive(Clone, Copy)]
@@ -101,7 +101,8 @@ fn sample(engine: &Engine, file: &Path, runs: usize) -> Result<Phases, String> {
 
 struct Row {
     benchmark: String,
-    size: usize,
+    /// `None` for a fixed program.
+    size: Option<usize>,
     engine: &'static str,
     outcome: Result<Phases, String>,
     output: &'static str,
@@ -126,8 +127,8 @@ pub fn run(
     let mut rows = vec![];
     for template in templates {
         println!("{}: {}", template.name, template.description);
-        for &size in &opts.sizes {
-            let file = out_dir.join(format!("{}-{size}.js", template.name));
+        for size in template.sizes(&opts.sizes) {
+            let file = out_dir.join(template.file_name(size));
             fs::write(&file, template.expand(size)).map_err(|e| e.to_string())?;
             let checks = if opts.check {
                 check_outputs(engines, &file)
@@ -160,7 +161,7 @@ pub fn run(
 }
 
 fn print_row(row: &Row) {
-    let lead = format!("{:<18} {:>8} {:<15}", "", row.size, row.engine);
+    let lead = format!("{:<18} {:>8} {:<15}", "", size_label(row.size), row.engine);
     match &row.outcome {
         Ok(p) => println!(
             "{lead} {:>9} {:>10.1} {:>9.2} {:>7.1} MB {:>7} {:>9}  {}",
@@ -195,7 +196,7 @@ fn csv(rows: &[Row]) -> String {
                 out,
                 "{},{},{},{},{:.3},{:.3},{},{},{},{},",
                 row.benchmark,
-                row.size,
+                row.size.map_or(String::new(), |n| n.to_string()),
                 row.engine,
                 p.parse_ms.map_or(String::new(), |v| format!("{v:.3}")),
                 p.compile_ms,
@@ -209,7 +210,7 @@ fn csv(rows: &[Row]) -> String {
                 out,
                 "{},{},{},,,,,,,{},\"{}\"",
                 row.benchmark,
-                row.size,
+                row.size.map_or(String::new(), |n| n.to_string()),
                 row.engine,
                 row.output,
                 e.replace('"', "\"\"")

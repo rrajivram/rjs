@@ -31,7 +31,8 @@ pub mod proto;
 #[derive(Debug, Clone)]
 pub enum JsValue {
     Number(f64),
-    BigInt(i128),
+    /// Boxed so the rare BigInt doesn't make every value 16-byte aligned.
+    BigInt(Rc<i128>),
     Str(Rc<str>),
     Bool(bool),
     Null,
@@ -40,6 +41,10 @@ pub enum JsValue {
     Object(Rc<dyn Object>),
     Function(Func),
 }
+
+// Values are copied constantly (registers, variables, arguments, array
+// elements), so keep them small: large or rare payloads go behind an `Rc`.
+const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 
 impl PartialEq for JsValue {
     fn eq(&self, other: &Self) -> bool {
@@ -109,9 +114,9 @@ impl Add for JsValue {
         let concat = |a: &dyn Display, b: &dyn Display| JsValue::Str(format!("{a}{b}").into());
         match (&self, &rhs) {
             (JsValue::Number(n), JsValue::Number(n1)) => JsValue::Number(n + n1),
-            (JsValue::BigInt(n), JsValue::BigInt(n1)) => JsValue::BigInt(n + n1),
-            (JsValue::BigInt(n), JsValue::Number(n1)) => JsValue::BigInt(n + *n1 as i128),
-            (JsValue::Number(n), JsValue::BigInt(n1)) => JsValue::Number(n + *n1 as f64),
+            (JsValue::BigInt(n), JsValue::BigInt(n1)) => JsValue::bigint(**n + **n1),
+            (JsValue::BigInt(n), JsValue::Number(n1)) => JsValue::bigint(**n + *n1 as i128),
+            (JsValue::Number(n), JsValue::BigInt(n1)) => JsValue::Number(n + **n1 as f64),
             (JsValue::Str(s1), JsValue::Str(s2)) => concat(s1, s2),
             (JsValue::Str(s), JsValue::BigInt(b)) => concat(s, b),
             (JsValue::Str(s), JsValue::Number(b)) => concat(s, b),
@@ -168,8 +173,11 @@ impl From<&str> for JsValue {
     }
 }
 
-
 impl JsValue {
+    pub fn bigint(n: i128) -> Self {
+        JsValue::BigInt(Rc::new(n))
+    }
+
     pub fn to_str(&self) -> String {
         format!("{self}")
     }
@@ -230,6 +238,14 @@ impl Object for JsValue {
     ) -> Result<(), JSError> {
         if let Self::Object(ob) = self {
             Ok(ob.call(engine, scope, method, args)?)
+        } else if let Self::Function(f) = self {
+            let args = args
+                .iter()
+                .map(|a| engine.resolve_value(a, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = engine.call_function(f, args)?;
+            engine.set_register(crate::executor::engine::Register::AX, result);
+            Ok(())
         } else {
             todo!()
         }

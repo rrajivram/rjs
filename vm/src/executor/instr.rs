@@ -1,33 +1,199 @@
-use std::rc::Rc;
+use std::{rc::Rc, time::Instant};
 
 use rjs_core::expr::BinaryOp;
 
 use crate::{
+    builtin::array::Array,
     error::JSError,
     executor::{
         engine::{JSEngine, Register},
         scope::{Scope, VariableType},
     },
-    primitive::{JsValue, objects::Object},
+    primitive::{JsValue, func::Func, objects::Object},
 };
 
 #[derive(Debug, Clone)]
+#[repr(usize)]
 pub enum Instruction {
-    Noop,
-    Hoist(Hoist),
-    Init(Init),
-    Declare(Declare),
-    Set(Set),
-    Binary(Binary),
-    GetAttr(GetAttr), //  Call(Call)
-    SetAttr(SetAttr),
-    Call(Call),
-    JumpIf(JumpIf),
-    Jump(Jump),
-    BeginScope,
-    EndScope,
-    Push(Push),
-    Pop(Pop),
+    Noop = 0,
+    Hoist(Hoist) = 1,
+    Init(Init) = 2,
+    Declare(Declare) = 3,
+    Set(Set) = 4,
+    Binary(Binary) = 5,
+    GetAttr(GetAttr) = 6, //  Call(Call)
+    SetAttr(SetAttr) = 7,
+    Call(Call) = 8,
+    JumpIf(JumpIf) = 9,
+    Jump(Jump) = 10,
+    BeginScope = 11,
+    EndScope = 12,
+    Push(Push) = 13,
+    Pop(Pop) = 14,
+    Iterable(Iterable) = 15,
+    GetIndex(GetIndex) = 16,
+    SetIndex(SetIndex) = 17,
+    Return(Return) = 18,
+    MakeFunction(MakeFunction) = 19,
+    Unary(Unary) = 20,
+}
+
+/// An operator on one value: `output = op value`.
+#[derive(Debug, Clone)]
+pub struct Unary {
+    pub op: UnaryOperator,
+    pub value: Operand,
+    pub output: Operand,
+}
+
+/// The operators `Unary` computes. `void`, `delete` and `await` aren't here:
+/// `void` needs no instruction, and the others aren't supported yet.
+#[derive(Debug, Clone, Copy)]
+pub enum UnaryOperator {
+    /// `+x`
+    Plus,
+    /// `-x`
+    Minus,
+    /// `!x`
+    Not,
+    /// `~x`
+    BitNot,
+    /// `typeof x`; `"undefined"` for an undeclared variable.
+    TypeOf,
+    /// The value `x++` and `x--` evaluate to: `x` as a Number or BigInt.
+    ToNumeric,
+    /// `x` as a Number or BigInt, plus one (`++`).
+    Increment,
+    /// `x` as a Number or BigInt, minus one (`--`).
+    Decrement,
+}
+
+impl UnaryOperator {
+    pub fn apply(self, value: &JsValue) -> Result<JsValue, JSError> {
+        Ok(match self {
+            Self::Plus => value.unary_plus()?,
+            Self::Minus => value.negate()?,
+            Self::Not => value.logical_not(),
+            Self::BitNot => value.bit_not()?,
+            Self::TypeOf => value.type_name().into(),
+            Self::ToNumeric => value.to_numeric_value()?,
+            Self::Increment => value.step(1)?,
+            Self::Decrement => value.step(-1)?,
+        })
+    }
+}
+
+/// Creates a function value from compiled code. The current scope becomes
+/// the parent scope of the function's calls.
+#[derive(Debug, Clone)]
+pub struct MakeFunction {
+    pub function: Func,
+    pub output: Operand,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Statistics {
+    pub instruction: &'static str,
+    pub count: usize,
+    pub us: u128,
+}
+
+impl Statistics {
+    pub const fn new(instruction: &'static str) -> Self {
+        Self {
+            instruction,
+            count: 0,
+            us: 0,
+        }
+    }
+}
+
+/// Number of instruction kinds: one entry per `Instruction` variant.
+pub const INSTRUCTION_KINDS: usize = 21;
+
+/// Zeroed statistics, one entry per instruction kind in declaration order.
+pub const INITIAL_STATS: [Statistics; INSTRUCTION_KINDS] = [
+    Statistics::new("Noop"),
+    Statistics::new("Hoist"),
+    Statistics::new("Init"),
+    Statistics::new("Declare"),
+    Statistics::new("Set"),
+    Statistics::new("Binary"),
+    Statistics::new("GetAttr"),
+    Statistics::new("SetAttr"),
+    Statistics::new("Call"),
+    Statistics::new("JumpIf"),
+    Statistics::new("Jump"),
+    Statistics::new("BeginScope"),
+    Statistics::new("EndScope"),
+    Statistics::new("Push"),
+    Statistics::new("Pop"),
+    Statistics::new("Iterable"),
+    Statistics::new("GetIndex"),
+    Statistics::new("SetIndex"),
+    Statistics::new("Return"),
+    Statistics::new("MakeFunction"),
+    Statistics::new("Unary"),
+];
+
+/// `object[index]`: a property read with a computed key.
+#[derive(Debug, Clone)]
+pub struct GetIndex {
+    pub object: Operand,
+    pub index: Operand,
+    pub output: Operand,
+}
+
+/// `object[index] = value`.
+#[derive(Debug, Clone)]
+pub struct SetIndex {
+    pub object: Operand,
+    pub index: Operand,
+    pub value: Operand,
+}
+
+/// A computed property key: an array index when the key is a whole number
+/// in range (`a[2]`), otherwise the key's string form (`a['length']`,
+/// `a[1.5]` is the key "1.5").
+enum Key {
+    Index(usize),
+    Name(String),
+}
+
+impl Key {
+    fn from_value(value: &JsValue) -> Result<Self, JSError> {
+        if let JsValue::Number(n) = value
+            && *n >= 0.0
+            && n.fract() == 0.0
+            && *n < u32::MAX as f64
+        {
+            return Ok(Key::Index(*n as usize));
+        }
+        let name = value.to_js_string()?;
+        Ok(match name.parse::<u32>() {
+            // "2" is the same key as 2, but "02" and "2.0" are names.
+            Ok(i) if i != u32::MAX && i.to_string() == name => Key::Index(i as usize),
+            _ => Key::Name(name),
+        })
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Key::Index(i) => i.to_string(),
+            Key::Name(name) => name.clone(),
+        }
+    }
+}
+
+/// Prepare a value for array destructuring: an array is used as it is, a
+/// string becomes an array of its characters, and anything else is a
+/// TypeError, because it isn't iterable.
+#[derive(Debug, Clone)]
+pub struct Iterable {
+    pub value: Operand,
+    pub output: Operand,
+    pub is_generator: bool,
+    pub pc: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +296,13 @@ pub enum JumpPos {
     Global(usize),
     Relative(isize),
     Label(String),
+    /// Leave the function being run (`return`).
+    Exit,
+}
+
+#[derive(Debug, Clone)]
+pub struct Return {
+    pub value: Option<Operand>,
 }
 
 impl Instruction {
@@ -138,6 +311,9 @@ impl Instruction {
         engine: &mut JSEngine,
         scope: &Rc<Scope>,
     ) -> Result<Option<JumpPos>, JSError> {
+        // Per-instruction statistics are only gathered in verbose mode: timing
+        // every instruction roughly doubles execution time.
+        let start = engine.verbose.then(Instant::now);
         let res = match self {
             Self::Noop => None,
             Self::Hoist(h) => self.hoist(scope, h)?,
@@ -152,10 +328,78 @@ impl Instruction {
             Self::Jump(j) => self.jump(engine, scope, j)?,
             Self::Push(p) => self.push(engine, scope, p)?,
             Self::Pop(p) => self.pop(engine, scope, p)?,
-
-            _ => None,
+            Self::Iterable(i) => self.iterable(engine, scope, i)?,
+            Self::GetIndex(g) => self.get_index(engine, scope, g)?,
+            Self::SetIndex(s) => self.set_index(engine, scope, s)?,
+            Self::Return(r) => self.do_return(engine, scope, r)?,
+            Self::MakeFunction(m) => self.make_function(engine, scope, m)?,
+            Self::Unary(u) => self.unary(engine, scope, u)?,
+            Self::BeginScope | Self::EndScope => None,
         };
+        if let Some(start) = start {
+            let time = start.elapsed().as_nanos();
+            let this = self.discriminant();
+            let stat = &mut engine.stats[this];
+            stat.count += 1;
+            stat.us += time;
+        }
         Ok(res)
+    }
+
+    /// `return value`: the value goes in AX, and the function ends.
+    fn do_return(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        ret: &Return,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = match &ret.value {
+            Some(v) => engine.resolve_value(v, scope)?,
+            None => JsValue::Undefined,
+        };
+        engine.set_register(Register::AX, value);
+        Ok(Some(JumpPos::Exit))
+    }
+
+    fn make_function(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        make: &MakeFunction,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let function = make.function.created_in(scope);
+        self.set(
+            engine,
+            scope,
+            &Set {
+                l_value: make.output.clone(),
+                r_value: Operand::Value(JsValue::Function(function)),
+            },
+        )
+    }
+
+    fn unary(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        unary: &Unary,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = match engine.resolve_value(&unary.value, scope) {
+            // `typeof` is the one place an undeclared variable isn't an error.
+            Err(JSError::ReferenceError(_)) if matches!(unary.op, UnaryOperator::TypeOf) => {
+                JsValue::Undefined
+            }
+            value => value?,
+        };
+        let result = unary.op.apply(&value)?;
+        self.set(
+            engine,
+            scope,
+            &Set {
+                l_value: unary.output.clone(),
+                r_value: Operand::Value(result),
+            },
+        )
     }
 
     fn push(
@@ -203,9 +447,7 @@ impl Instruction {
         scope: &Rc<Scope>,
         jump: &JumpIf,
     ) -> Result<Option<JumpPos>, JSError> {
-        let value = engine
-            .resolve_value(&jump.value, scope)?
-            .to_boolean();
+        let value = engine.resolve_value(&jump.value, scope)?.to_boolean();
         if value == jump.if_true {
             Ok(Some(jump.pos.clone()))
         } else {
@@ -220,14 +462,35 @@ impl Instruction {
         scope: &Rc<Scope>,
         call: &Call,
     ) -> Result<Option<JumpPos>, JSError> {
-        if let JsValue::Function(func) = &engine.resolve_value(&call.function, scope)? {
-            if let Some(object) = &call.object {
-                let object = engine.resolve_value(object, scope)?;
-                object.call(engine, scope, func, &call.args)?;
-                return Ok(None);
-            }
+        let callee = engine.resolve_value(&call.function, scope)?;
+        let JsValue::Function(func) = &callee else {
+            let name = match &call.function {
+                Operand::Var(name) => name.clone(),
+                _ => callee.to_js_string().unwrap_or_else(|_| "value".into()),
+            };
+            return Err(JSError::TypeError(format!("{name} is not a function")));
+        };
+        // A function written in JS: the engine runs it before the next
+        // instruction. Methods don't get `this` yet, so a call through an
+        // object (`obj.f()`) ignores the object.
+        if func.instructions.is_some() {
+            let args = call
+                .args
+                .iter()
+                .map(|a| engine.resolve_value(a, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            engine.pending_call = Some(func.enter(args)?);
+            return Ok(None);
         }
-        Err(JSError::UnknownError("Call error".into()))
+        // A built-in method, which needs the object it was read from.
+        let Some(object) = &call.object else {
+            return Err(JSError::TypeError(format!(
+                "{func} must be called as a method"
+            )));
+        };
+        let object = engine.resolve_value(object, scope)?;
+        object.call(engine, scope, func, &call.args)?;
+        Ok(None)
     }
 
     fn get_attr(
@@ -298,6 +561,101 @@ impl Instruction {
         Ok(None)
     }
 
+    fn get_index(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        get: &GetIndex,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let object = engine.resolve_value(&get.object, scope)?;
+        let key = Key::from_value(&engine.resolve_value(&get.index, scope)?)?;
+        let value = match (&object, &key) {
+            (JsValue::Object(o), Key::Index(i)) if o.as_array().is_some() => {
+                o.as_array().expect("checked above").get_index(*i)
+            }
+            // Other keys on an array (`a[-1]`, `a[1.5]`) aren't elements or
+            // methods, so they're missing: undefined.
+            (JsValue::Object(o), Key::Name(name))
+                if o.as_array().is_some() && name.parse::<f64>().is_ok() =>
+            {
+                JsValue::Undefined
+            }
+            (JsValue::Object(o), key) => o.get_prop(&key.name())?,
+            (JsValue::Str(s), Key::Index(i)) => {
+                s.encode_utf16().nth(*i).map_or(JsValue::Undefined, |unit| {
+                    String::from_utf16_lossy(&[unit]).into()
+                })
+            }
+            (JsValue::Str(s), Key::Name(name)) if name == "length" => {
+                (s.encode_utf16().count() as f64).into()
+            }
+            (JsValue::Null | JsValue::Undefined, key) => {
+                return Err(JSError::TypeError(format!(
+                    "Cannot read properties of {object} (reading '{}')",
+                    key.name()
+                )));
+            }
+            _ => JsValue::Undefined,
+        };
+        self.set(
+            engine,
+            scope,
+            &Set {
+                l_value: get.output.clone(),
+                r_value: Operand::Value(value),
+            },
+        )
+    }
+
+    fn set_index(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        set: &SetIndex,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let object = engine.resolve_value(&set.object, scope)?;
+        let key = Key::from_value(&engine.resolve_value(&set.index, scope)?)?;
+        let value = engine.resolve_value(&set.value, scope)?;
+        match (&object, &key) {
+            (JsValue::Object(o), Key::Index(i)) if o.as_array().is_some() => {
+                o.as_array().expect("checked above").set_index(*i, value);
+            }
+            (JsValue::Object(o), key) => o.set_prop(&key.name(), value)?,
+            _ => {
+                return Err(JSError::TypeError(format!(
+                    "Cannot set properties of {object} (setting '{}')",
+                    key.name()
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn iterable(
+        &self,
+        engine: &mut JSEngine,
+        scope: &Rc<Scope>,
+        iterable: &Iterable,
+    ) -> Result<Option<JumpPos>, JSError> {
+        let value = engine.resolve_value(&iterable.value, scope)?;
+        let array = match &value {
+            JsValue::Object(object) if object.as_array().is_some() => value.clone(),
+            JsValue::Str(s) => Array::create(s.chars().map(|c| c.to_string().into()).collect()),
+            other => {
+                let shown = other.to_js_string().unwrap_or_else(|_| "Symbol()".into());
+                return Err(JSError::TypeError(format!("{shown} is not iterable")));
+            }
+        };
+        self.set(
+            engine,
+            scope,
+            &Set {
+                l_value: iterable.output.clone(),
+                r_value: Operand::Value(array),
+            },
+        )
+    }
+
     fn set(
         &self,
         engine: &mut JSEngine,
@@ -309,7 +667,9 @@ impl Instruction {
             (Operand::Var(v), Operand::Register(r)) => {
                 scope.set_variable(v, engine.get_register(*r))?
             }
-            (Operand::Var(v1), Operand::Var(v2)) => scope.set_variable(v1, scope.get_variable(v2)?)?,
+            (Operand::Var(v1), Operand::Var(v2)) => {
+                scope.set_variable(v1, scope.get_variable(v2)?)?
+            }
             (Operand::Register(r1), Operand::Register(r2)) => {
                 engine.set_register(*r1, engine.get_register(*r2));
             }
@@ -367,6 +727,13 @@ impl Instruction {
         };
         engine.set_register(register, reg);
         Ok(None)
+    }
+
+    fn discriminant(&self) -> usize {
+        // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<usize>() }
     }
 }
 
@@ -538,8 +905,7 @@ mod tests {
     fn test_get_attr() {
         let mut engine = engine();
         let scope = engine.scope.clone();
-        let objprim =
-            ObjectPrimitive::new(BTreeMap::from([("prop1".into(), JsValue::from(0.1))]));
+        let objprim = ObjectPrimitive::new(BTreeMap::from([("prop1".into(), JsValue::from(0.1))]));
         let obj = JsValue::Object(Rc::new(objprim));
         scope
             .add_variable("first", crate::executor::scope::VariableType::Any, obj)
@@ -628,32 +994,24 @@ mod tests {
     }
 
     fn big(n: i128) -> JsValue {
-        JsValue::BigInt(n)
+        JsValue::bigint(n)
     }
 
     fn bigint(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> i128 {
         match &eval(left, op, right).unwrap() {
-            JsValue::BigInt(n) => *n,
+            JsValue::BigInt(n) => **n,
             other => panic!("expected a BigInt, got {other:?}"),
         }
     }
 
-    fn type_error(
-        left: impl Into<JsValue>,
-        op: BinaryOp,
-        right: impl Into<JsValue>,
-    ) -> String {
+    fn type_error(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> String {
         match eval(left, op, right) {
             Err(JSError::TypeError(m)) => m,
             other => panic!("expected a TypeError, got {other:?}"),
         }
     }
 
-    fn range_error(
-        left: impl Into<JsValue>,
-        op: BinaryOp,
-        right: impl Into<JsValue>,
-    ) -> String {
+    fn range_error(left: impl Into<JsValue>, op: BinaryOp, right: impl Into<JsValue>) -> String {
         match eval(left, op, right) {
             Err(JSError::RangeError(m)) => m,
             other => panic!("expected a RangeError, got {other:?}"),
@@ -868,12 +1226,8 @@ mod tests {
     fn test_objects_compare_by_identity() {
         let mut engine = engine();
         let scope = engine.scope.clone();
-        let object = JsValue::Object(Rc::new(ObjectPrimitive::new(
-            Default::default(),
-        )));
-        let lookalike = JsValue::Object(Rc::new(ObjectPrimitive::new(
-            Default::default(),
-        )));
+        let object = JsValue::Object(Rc::new(ObjectPrimitive::new(Default::default())));
+        let lookalike = JsValue::Object(Rc::new(ObjectPrimitive::new(Default::default())));
         let same = Instruction::Binary(Binary {
             left: object.clone().into(),
             op: BinaryOp::StrictEq,
