@@ -14,6 +14,7 @@ use crate::{
     primitive::{
         JsValue,
         func::Func,
+        key::PropertyKey,
         objects::{Object, ObjectPrimitive},
         proto::{Prototype, RcPrototype},
     },
@@ -76,8 +77,8 @@ thread_local! {
             .iter()
             .chain(CALLBACK_METHODS)
             .chain(ITERATOR_METHODS)
-            .map(|m| (m.to_string(), JsValue::Function((*m).into())))
-            .chain([("prototype".to_string(), JsValue::Undefined)])
+            .map(|m| (PropertyKey::from(*m), JsValue::Function((*m).into())))
+            .chain([("prototype".into(), JsValue::Undefined)])
             .collect::<HashMap<_, _>>(),
         Some(ObjectPrimitive::defaul_prototype()),
     )
@@ -599,10 +600,10 @@ impl Object for Array {
         Some(self)
     }
 
-    fn get_props(&self) -> Vec<String> {
+    fn get_props(&self) -> Vec<PropertyKey> {
         (0..self.len())
-            .map(|i| i.to_string())
-            .chain(["length".to_string()])
+            .map(|i| i.to_string().into())
+            .chain(["length".into()])
             .collect()
     }
 
@@ -615,11 +616,11 @@ impl Object for Array {
             .collect()
     }
 
-    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError> {
+    fn get_prop(&self, prop: &PropertyKey) -> Result<JsValue, JSError> {
         if prop == "length" {
             return Ok((self.len() as f64).into());
         }
-        if let Some(i) = array_index(prop) {
+        if let Some(i) = prop.as_str().and_then(array_index) {
             return Ok(self
                 .items
                 .borrow()
@@ -630,11 +631,11 @@ impl Object for Array {
         self.prototype().0.borrow().get(prop)
     }
 
-    fn set_prop(&self, prop: &str, value: JsValue) -> Result<(), JSError> {
+    fn set_prop(&self, prop: &PropertyKey, value: JsValue) -> Result<(), JSError> {
         if prop == "length" {
             return self.set_length(&value);
         }
-        if let Some(i) = array_index(prop) {
+        if let Some(i) = prop.as_str().and_then(array_index) {
             self.set_index(i, value);
             return Ok(());
         }
@@ -643,9 +644,12 @@ impl Object for Array {
         )))
     }
 
-    fn has_prop(&self, prop: &str) -> bool {
+    fn has_prop(&self, prop: &PropertyKey) -> bool {
         prop == "length"
-            || array_index(prop).is_some_and(|i| i < self.len())
+            || prop
+                .as_str()
+                .and_then(array_index)
+                .is_some_and(|i| i < self.len())
             || self.prototype().0.borrow().get(prop).is_ok()
     }
 
@@ -653,7 +657,7 @@ impl Object for Array {
         self.prototype()
             .0
             .borrow()
-            .get(method)
+            .get(&method.into())
             .is_ok_and(|m| matches!(&m, JsValue::Function(_)))
     }
 
@@ -664,7 +668,7 @@ impl Object for Array {
         method: &Func,
         args: &[Operand],
     ) -> Result<(), JSError> {
-        if let JsValue::Function(func) = &self.get_prop(&method.name)? {
+        if let JsValue::Function(func) = &self.get_prop(&PropertyKey::Str(method.name.clone()))? {
             self.call_func(func, engine, scope, args)
         } else {
             Err(JSError::RefereneError(method.to_string()))
@@ -679,7 +683,11 @@ impl Object for Array {
 #[cfg(test)]
 mod tests {
     use super::Array;
-    use crate::{error::JSError, executor::engine::JSEngine, primitive::JsValue};
+    use crate::{
+        error::JSError,
+        executor::engine::JSEngine,
+        primitive::{JsValue, key::PropertyKey},
+    };
 
     /// Run `src` and return variable `s` as a string.
     fn eval(src: &str) -> String {
@@ -992,24 +1000,28 @@ mod tests {
         let JsValue::Object(object) = &array else {
             unreachable!()
         };
-        assert_eq!(object.get_prop("1").unwrap(), 2.0.into());
-        assert_eq!(object.get_prop("7").unwrap(), JsValue::Undefined);
-        assert!(object.has_prop("2") && !object.has_prop("3") && object.has_prop("push"));
-        object.set_prop("4", "x".into()).unwrap();
-        assert_eq!(object.get_prop("length").unwrap(), 5.0.into());
+        let key = PropertyKey::from;
+        assert_eq!(object.get_prop(&key("1")).unwrap(), 2.0.into());
+        assert_eq!(object.get_prop(&key("7")).unwrap(), JsValue::Undefined);
+        assert!(
+            object.has_prop(&key("2")) && !object.has_prop(&key("3")) && object.has_prop(&key("push"))
+        );
+        assert!(!object.has_prop(&PropertyKey::ITERATOR));
+        object.set_prop(&key("4"), "x".into()).unwrap();
+        assert_eq!(object.get_prop(&key("length")).unwrap(), 5.0.into());
         assert_eq!(
-            object.get_prop("3").unwrap(),
+            object.get_prop(&key("3")).unwrap(),
             JsValue::Undefined,
             "the gap is filled"
         );
-        object.set_prop("length", 2.0.into()).unwrap();
+        object.set_prop(&key("length"), 2.0.into()).unwrap();
         assert_eq!(object.as_array().unwrap().join_with(",").unwrap(), "1,2");
         assert!(matches!(
-            object.set_prop("length", (-1.0).into()),
+            object.set_prop(&key("length"), (-1.0).into()),
             Err(JSError::RangeError(_))
         ));
         assert!(matches!(
-            object.set_prop("length", 1.5.into()),
+            object.set_prop(&key("length"), 1.5.into()),
             Err(JSError::RangeError(_))
         ));
     }

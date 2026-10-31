@@ -6,6 +6,7 @@ use crate::{
     primitive::{
         JsValue,
         func::Func,
+        key::PropertyKey,
         objects::Object,
         proto::{Prototype, RcPrototype},
     },
@@ -39,12 +40,13 @@ impl Object for Console {
         CONSOLE_PROTO.with(|p| p.clone())
     }
 
-    fn get_props(&self) -> Vec<String> {
+    fn get_props(&self) -> Vec<PropertyKey> {
         vec![LOG.into(), WARN.into(), ERROR.into()]
     }
 
-    fn has_prop(&self, prop: &str) -> bool {
-        matches!(prop, LOG | WARN | ERROR)
+    fn has_prop(&self, prop: &PropertyKey) -> bool {
+        prop.as_str()
+            .is_some_and(|p| matches!(p, LOG | WARN | ERROR))
     }
 
     fn has_method(&self, method: &str) -> bool {
@@ -52,10 +54,10 @@ impl Object for Console {
     }
 
     fn get_methods(&self) -> Vec<String> {
-        todo!()
+        vec![LOG.into(), WARN.into(), ERROR.into()]
     }
 
-    fn get_prop(&self, prop: &str) -> Result<JsValue, JSError> {
+    fn get_prop(&self, prop: &PropertyKey) -> Result<JsValue, JSError> {
         self.prototype().0.borrow().get(prop)
     }
 

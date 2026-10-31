@@ -41,9 +41,19 @@ Left, roughly easiest first:
    `obj.x++`): `ObjectPrimitive` and `SetAttr` exist; decide how to create an
    object (a built-in like `Array.new`, or a `MakeObject` instruction).
 4. **Spread** in array literals and calls.
-5. **BigInt literals** (`1n`) aren't parsed; the VM's BigInt arithmetic is
+5. **`this` and symbols, what's left.** `Symbol()`, `Symbol.iterator`,
+   `Symbol.asyncIterator` and `call`/`apply`/`bind` work, and each call's
+   scope has a `this` variable (the object for `obj.f()`, otherwise
+   undefined). Left: `Expr::This` (emit `Operand::Var("this")`); `this` for
+   `obj[k]()` calls (only `obj.f()` passes its object); symbol descriptions
+   (`Symbol('x')` keeps no description); `typeof Symbol` is "object", not
+   "function". Adding `this` to every call's scope made `fib(25)` about 15%
+   slower: add `this` and `arguments` only for functions that use them (a
+   compile-time check of the body), or let variable slots (performance
+   item 2) make it free.
+6. **BigInt literals** (`1n`) aren't parsed; the VM's BigInt arithmetic is
    only reachable from Rust.
-6. **Exceptions** (`throw`, `try`/`catch`/`finally`): unwinding through
+7. **Exceptions** (`throw`, `try`/`catch`/`finally`): unwinding through
    frames and their block scopes. `NotSupported` for now, as are `for-in`,
    classes and modules.
 

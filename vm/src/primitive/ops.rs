@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     error::JSError,
-    primitive::{JsValue},
+    primitive::{JsValue, key::PropertyKey},
 };
 
 /// A value after ToNumeric: arithmetic works on either, but never a mix.
@@ -516,6 +516,17 @@ impl JsValue {
         if self.is_nullish() { rhs } else { self }
     }
 
+    /// `self + rhs`: string concatenation if either side is a string once
+    /// converted to a primitive, numeric addition otherwise.
+    pub fn plus(&self, rhs: &Self) -> Result<Self, JSError> {
+        let (a, b) = (self.to_primitive(), rhs.to_primitive());
+        if matches!(*a, JsValue::Str(_)) || matches!(*b, JsValue::Str(_)) {
+            let joined = a.to_js_string()? + &b.to_js_string()?;
+            return Ok(JsValue::Str(joined.into()));
+        }
+        numeric_op(&a, &b, |x, y| x + y, |x, y| x.checked_add(y).ok_or_else(overflow))
+    }
+
     /// `+self`: ToNumber, so a BigInt is a TypeError.
     pub fn unary_plus(&self) -> Result<Self, JSError> {
         Ok(JsValue::Number(self.to_number()?))
@@ -579,15 +590,11 @@ impl JsValue {
     /// `self in rhs`: whether the object `rhs` has a property named `self`.
     pub fn is_in(&self, rhs: &Self) -> Result<Self, JSError> {
         let found = match rhs {
-            JsValue::Object(object) => match self {
-                // Properties are keyed by string; no object holds a symbol key.
-                JsValue::Symbol(_) => false,
-                key => object.has_prop(&key.to_js_string()?),
-            },
+            JsValue::Object(object) => object.has_prop(&PropertyKey::from_value(self)?),
             // Functions carry no properties in this VM.
             JsValue::Function(_) => false,
             other => {
-                let key = self.to_js_string().unwrap_or_else(|_| "Symbol()".into());
+                let key = PropertyKey::from_value(self).map_or("Symbol()".into(), |k| k.to_string());
                 let target = other.to_js_string().unwrap_or_else(|_| "Symbol()".into());
                 return Err(type_error(format!(
                     "Cannot use 'in' operator to search for '{key}' in {target}"
@@ -689,6 +696,26 @@ mod tests {
         assert!(matches!(b.unary_plus(), Err(JSError::TypeError(_))));
         assert!(matches!(
             JsValue::bigint(i128::MIN).negate(),
+            Err(JSError::RangeError(_))
+        ));
+    }
+
+    #[test]
+    fn plus_follows_js() {
+        let plus = |a: JsValue, b: JsValue| a.plus(&b);
+        assert!(matches!(plus(JsValue::Undefined, JsValue::Undefined), Ok(JsValue::Number(n)) if n.is_nan()));
+        assert_eq!(plus(JsValue::Null, 1.0.into()).unwrap(), 1.0.into());
+        assert_eq!(plus(true.into(), 1.0.into()).unwrap(), 2.0.into());
+        assert_eq!(plus("1".into(), 2.0.into()).unwrap(), "12".into());
+        assert_eq!(plus(0.5.into(), "x".into()).unwrap(), "0.5x".into());
+        assert_eq!(plus(JsValue::Undefined, "".into()).unwrap(), "undefined".into());
+        assert_eq!(plus(JsValue::bigint(2), JsValue::bigint(3)).unwrap(), JsValue::bigint(5));
+        assert_eq!(plus(JsValue::bigint(2), "x".into()).unwrap(), "2x".into());
+        assert!(matches!(plus(JsValue::bigint(2), 1.0.into()), Err(JSError::TypeError(_))));
+        assert!(matches!(plus(JsValue::Symbol(1), 1.0.into()), Err(JSError::TypeError(_))));
+        assert!(matches!(plus(JsValue::Symbol(1), "".into()), Err(JSError::TypeError(_))));
+        assert!(matches!(
+            plus(JsValue::bigint(i128::MAX), JsValue::bigint(1)),
             Err(JSError::RangeError(_))
         ));
     }

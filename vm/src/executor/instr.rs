@@ -9,7 +9,7 @@ use crate::{
         engine::{JSEngine, Register},
         scope::{Scope, VariableType},
     },
-    primitive::{JsValue, func::Func, objects::Object},
+    primitive::{JsValue, func::Func, key::PropertyKey, objects::Object},
 };
 
 #[derive(Debug, Clone)]
@@ -153,11 +153,11 @@ pub struct SetIndex {
 }
 
 /// A computed property key: an array index when the key is a whole number
-/// in range (`a[2]`), otherwise the key's string form (`a['length']`,
+/// in range (`a[2]`), otherwise a property key (`a['length']`, `a[sym]`;
 /// `a[1.5]` is the key "1.5").
 enum Key {
     Index(usize),
-    Name(String),
+    Prop(PropertyKey),
 }
 
 impl Key {
@@ -169,18 +169,21 @@ impl Key {
         {
             return Ok(Key::Index(*n as usize));
         }
-        let name = value.to_js_string()?;
+        let key = PropertyKey::from_value(value)?;
+        let Some(name) = key.as_str() else {
+            return Ok(Key::Prop(key));
+        };
         Ok(match name.parse::<u32>() {
             // "2" is the same key as 2, but "02" and "2.0" are names.
             Ok(i) if i != u32::MAX && i.to_string() == name => Key::Index(i as usize),
-            _ => Key::Name(name),
+            _ => Key::Prop(key),
         })
     }
 
-    fn name(&self) -> String {
+    fn prop(&self) -> PropertyKey {
         match self {
-            Key::Index(i) => i.to_string(),
-            Key::Name(name) => name.clone(),
+            Key::Index(i) => i.to_string().into(),
+            Key::Prop(key) => key.clone(),
         }
     }
 }
@@ -192,7 +195,6 @@ impl Key {
 pub struct Iterable {
     pub value: Operand,
     pub output: Operand,
-    pub is_generator: bool,
     pub pc: Option<usize>,
 }
 
@@ -224,7 +226,7 @@ pub struct Call {
 #[derive(Debug, Clone)]
 pub struct GetAttr {
     pub object: Operand,
-    pub attrib: String,
+    pub attrib: PropertyKey,
     pub output: Operand,
     pub obj_output: Operand,
 }
@@ -232,7 +234,7 @@ pub struct GetAttr {
 #[derive(Debug, Clone)]
 pub struct SetAttr {
     pub object: Operand,
-    pub attrib: String,
+    pub attrib: PropertyKey,
     pub input: Operand,
 }
 
@@ -463,33 +465,43 @@ impl Instruction {
         call: &Call,
     ) -> Result<Option<JumpPos>, JSError> {
         let callee = engine.resolve_value(&call.function, scope)?;
-        let JsValue::Function(func) = &callee else {
-            let name = match &call.function {
-                Operand::Var(name) => name.clone(),
-                _ => callee.to_js_string().unwrap_or_else(|_| "value".into()),
-            };
-            return Err(JSError::TypeError(format!("{name} is not a function")));
+        let func = match &callee {
+            JsValue::Function(func) => func,
+            // A built-in object that can be called, like `Symbol()`.
+            JsValue::Object(object) => {
+                object.call_as_function(engine, scope, &call.args)?;
+                return Ok(None);
+            }
+            _ => {
+                let name = match &call.function {
+                    Operand::Var(name) => name.clone(),
+                    _ => callee.to_js_string().unwrap_or_else(|_| "value".into()),
+                };
+                return Err(JSError::TypeError(format!("{name} is not a function")));
+            }
         };
-        // A function written in JS: the engine runs it before the next
-        // instruction. Methods don't get `this` yet, so a call through an
-        // object (`obj.f()`) ignores the object.
-        if func.instructions.is_some() {
-            let args = call
-                .args
-                .iter()
-                .map(|a| engine.resolve_value(a, scope))
-                .collect::<Result<Vec<_>, _>>()?;
-            engine.pending_call = Some(func.enter(args)?);
+        // A method call (`obj.f()`) gets the object as `this`.
+        let this = match &call.object {
+            Some(object) => engine.resolve_value(object, scope)?,
+            None => JsValue::Undefined,
+        };
+        // A built-in resolves its own arguments.
+        if func.instructions.is_none() && func.bound_args.is_empty() {
+            let this = func.bound_this.clone().unwrap_or(this);
+            if matches!(this, JsValue::Undefined) {
+                return Err(JSError::TypeError(format!(
+                    "{func} must be called as a method"
+                )));
+            }
+            this.call(engine, scope, func, &call.args)?;
             return Ok(None);
         }
-        // A built-in method, which needs the object it was read from.
-        let Some(object) = &call.object else {
-            return Err(JSError::TypeError(format!(
-                "{func} must be called as a method"
-            )));
-        };
-        let object = engine.resolve_value(object, scope)?;
-        object.call(engine, scope, func, &call.args)?;
+        let args = call
+            .args
+            .iter()
+            .map(|a| engine.resolve_value(a, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        func.invoke(engine, scope, this, args)?;
         Ok(None)
     }
 
@@ -575,24 +587,24 @@ impl Instruction {
             }
             // Other keys on an array (`a[-1]`, `a[1.5]`) aren't elements or
             // methods, so they're missing: undefined.
-            (JsValue::Object(o), Key::Name(name))
-                if o.as_array().is_some() && name.parse::<f64>().is_ok() =>
+            (JsValue::Object(o), Key::Prop(key))
+                if o.as_array().is_some() && key.as_str().is_some_and(|k| k.parse::<f64>().is_ok()) =>
             {
                 JsValue::Undefined
             }
-            (JsValue::Object(o), key) => o.get_prop(&key.name())?,
+            (JsValue::Object(o), key) => o.get_prop(&key.prop())?,
             (JsValue::Str(s), Key::Index(i)) => {
                 s.encode_utf16().nth(*i).map_or(JsValue::Undefined, |unit| {
                     String::from_utf16_lossy(&[unit]).into()
                 })
             }
-            (JsValue::Str(s), Key::Name(name)) if name == "length" => {
+            (JsValue::Str(s), Key::Prop(key)) if key == "length" => {
                 (s.encode_utf16().count() as f64).into()
             }
             (JsValue::Null | JsValue::Undefined, key) => {
                 return Err(JSError::TypeError(format!(
                     "Cannot read properties of {object} (reading '{}')",
-                    key.name()
+                    key.prop()
                 )));
             }
             _ => JsValue::Undefined,
@@ -620,11 +632,11 @@ impl Instruction {
             (JsValue::Object(o), Key::Index(i)) if o.as_array().is_some() => {
                 o.as_array().expect("checked above").set_index(*i, value);
             }
-            (JsValue::Object(o), key) => o.set_prop(&key.name(), value)?,
+            (JsValue::Object(o), key) => o.set_prop(&key.prop(), value)?,
             _ => {
                 return Err(JSError::TypeError(format!(
                     "Cannot set properties of {object} (setting '{}')",
-                    key.name()
+                    key.prop()
                 )));
             }
         }
@@ -677,7 +689,9 @@ impl Instruction {
                 engine.set_register(*r, scope.get_variable(v)?);
             }
             (Operand::Register(r), Operand::Value(p)) => engine.set_register(*r, p.clone()),
-            (_, _) => todo!(),
+            (Operand::Value(v), _) => {
+                return Err(JSError::UnknownError(format!("can't assign to the value {v}")));
+            }
         }
         Ok(None)
     }
@@ -745,7 +759,7 @@ impl Operand {
         scope: &Rc<Scope>,
     ) -> Result<JsValue, JSError> {
         let (p1, p2) = self.get_vars(rhs, engine, scope)?;
-        Ok(p1 + p2)
+        p1.plus(&p2)
     }
 
     /// Resolve both operands and apply `op`.
@@ -1271,8 +1285,9 @@ mod tests {
     #[test]
     fn test_in() {
         let props = [
-            ("a".to_string(), JsValue::from(1.0)),
-            ("0".to_string(), 2.0.into()),
+            (PropertyKey::from("a"), JsValue::from(1.0)),
+            ("0".into(), 2.0.into()),
+            (PropertyKey::ITERATOR, 3.0.into()),
         ];
         let object = || {
             JsValue::Object(Rc::new(ObjectPrimitive::new(
@@ -1281,6 +1296,10 @@ mod tests {
         };
         assert!(boolean("a", BinaryOp::In, object()));
         assert!(!boolean("b", BinaryOp::In, object()));
+        // Symbol keys are their own keys, distinct from every string.
+        assert!(boolean(JsValue::Symbol(1), BinaryOp::In, object()));
+        assert!(!boolean(JsValue::Symbol(2), BinaryOp::In, object()));
+        assert!(!boolean("Symbol(Symbol.iterator)", BinaryOp::In, object()));
         assert!(
             boolean(0.0, BinaryOp::In, object()),
             "the key is converted to a string"

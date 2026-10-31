@@ -8,9 +8,9 @@ use rustc_hash::FxHashMap;
 use rjs_core::statement::DeclKind;
 
 use crate::{
-    builtin::{array::Array, console::Console},
+    builtin::{array::Array, console::Console, symbol::SymbolObject},
     error::JSError,
-    primitive::{JsValue},
+    primitive::JsValue,
 };
 
 /// Variables visible at one level of nesting. A scope only knows its parent:
@@ -73,10 +73,6 @@ impl Variable {
     pub fn init(&mut self, value: JsValue) {
         self.value = value;
     }
-
-    pub fn get(&self, _name: &str) -> Result<Option<Rc<RefCell<Self>>>, JSError> {
-        todo!()
-    }
 }
 
 impl Scope {
@@ -90,6 +86,12 @@ impl Scope {
             .unwrap();
         let array = JsValue::Object(Rc::new(Array::new()));
         this.add_variable("Array", VariableType::Const, array)
+            .unwrap();
+        let symbol = JsValue::Object(Rc::new(SymbolObject::default()));
+        this.add_variable("Symbol", VariableType::Const, symbol)
+            .unwrap();
+        // Top-level code runs with `this` undefined; each call has its own.
+        this.add_variable("this", VariableType::Const, JsValue::Undefined)
             .unwrap();
         this
     }

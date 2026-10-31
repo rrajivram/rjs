@@ -275,7 +275,7 @@ impl JSEngine {
     /// given) and returns its result. Runs a nested `run_frame`, so unlike
     /// calls from JS this does recurse in Rust.
     pub fn call_function(&mut self, func: &Func, args: Vec<JsValue>) -> Result<JsValue, JSError> {
-        let (code, scope) = func.enter(args)?;
+        let (code, scope) = func.enter(JsValue::Undefined, args)?;
         self.enter_call()?;
         let returned = self.run_frame(scope, &code)?;
         self.call_depth -= 1;
@@ -400,10 +400,8 @@ impl JSEngine {
     /// parameters and destructuring all work; then it hoists its own
     /// declarations like a program does.
     fn emit_function(&mut self, func: &Function, name: String) -> Result<Func, JSError> {
-        if func.is_async  {
-            return Err(JSError::NotSupported(
-                "async  functions".into(),
-            ));
+        if func.is_async {
+            return Err(JSError::NotSupported("async  functions".into()));
         }
         // The body is compiled in the middle of the enclosing code; keep its
         // temporaries' numbering apart.
@@ -435,7 +433,19 @@ impl JSEngine {
         self.jump_targets = saved_targets;
         self.scope_depth = saved_depth;
         self.pending_labels = saved_labels;
-        Ok(Func::compiled(&name, link(ins)?))
+        // `length` counts the parameters before the first default or rest.
+        let arg_count = func
+            .params
+            .iter()
+            .take_while(|p| !matches!(p, Pattern::Default(..) | Pattern::Rest(_)))
+            .count();
+        Ok(Func::compiled(
+            &name,
+            link(ins)?,
+            func.generator,
+            func.is_async,
+            arg_count,
+        ))
     }
 
     fn emit_for(
@@ -548,7 +558,6 @@ impl JSEngine {
             Instruction::Iterable(Iterable {
                 value,
                 output: ax.clone(),
-                is_generator: false,
                 pc: None,
             })
             .into(),
@@ -965,7 +974,6 @@ impl JSEngine {
                     Instruction::Iterable(Iterable {
                         value,
                         output: Operand::Register(Register::AX),
-                        is_generator: false,
                         pc: None,
                     })
                     .into(),
@@ -1050,7 +1058,7 @@ impl JSEngine {
                 delegate,
                 value,
             } => todo!(),
-            Expr::This(_token_span) => todo!(),
+            Expr::This(_token_span) => Ok(InstructionType::Value(Operand::Var("this".into()))),
             Expr::Super(_token_span) => todo!(),
             Expr::Object(_items) => todo!(),
             Expr::Function(_function) => todo!(),
@@ -1725,7 +1733,7 @@ impl JSEngine {
         ins.push(
             Instruction::GetAttr(GetAttr {
                 object,
-                attrib: prop.value.clone(),
+                attrib: prop.value.as_str().into(),
                 output: Operand::Register(Register::AX),
                 obj_output: Operand::Register(Register::BX),
             })
@@ -1756,13 +1764,16 @@ impl JSEngine {
             };
             ins.push(Self::declare_instr(name, VariableType::Any, value));
         }
+        // Only a member expression (`obj.f`) leaves an object in BX, to
+        // become the call's `this`.
+        let is_method = matches!(unparen(callee), Expr::Member { .. });
         let callee = self.emit_exprs(callee, None)?;
         match callee {
             InstructionType::Instruction(i) => {
                 ins.extend(i);
                 ins.push(
                     Instruction::Call(Call {
-                        object: Some(Operand::Register(Register::BX)),
+                        object: is_method.then_some(Operand::Register(Register::BX)),
                         args: names,
                         function: Operand::Register(Register::AX),
                     })
@@ -1982,6 +1993,14 @@ fn binding_names(target: &Pattern) -> Vec<String> {
 
 /// Whether evaluating `ex` could change a variable or an object (by
 /// assigning, calling something, ...). Errs on the side of yes.
+/// `ex` without any parentheses around it.
+fn unparen(mut ex: &Expr) -> &Expr {
+    while let Expr::Paren(inner) = ex {
+        ex = inner;
+    }
+    ex
+}
+
 fn may_have_effects(ex: &Expr) -> bool {
     match ex {
         Expr::Literal(_) | Expr::Ident(_) | Expr::This(_) | Expr::Super(_) => false,
@@ -2082,7 +2101,7 @@ mod tests {
 
     use super::*;
 
-    const SOURCE: &str = "function fi(a,b) { return a+b;}";
+    const SOURCE: &str = "function fi() { return 'abc';} for (let a of fi()) {console.log(a);}";
 
     #[ignore]
     #[test]
@@ -3484,6 +3503,109 @@ mod tests {
         );
         let err = run_err("notDeclared;");
         assert!(matches!(err, JSError::ReferenceError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_symbols() {
+        for (src, expected) in [
+            ("let r = typeof Symbol.iterator", JsValue::from("symbol")),
+            ("let r = Symbol.iterator === Symbol.iterator", true.into()),
+            (
+                "let r = Symbol.iterator === Symbol.asyncIterator",
+                false.into(),
+            ),
+            ("let r = Symbol() === Symbol()", false.into()),
+            ("let s = Symbol('x'); let r = s === s", true.into()),
+            ("let r = typeof Symbol('x')", "symbol".into()),
+            (
+                "let r = Symbol.iterator.toString()",
+                "Symbol(Symbol.iterator)".into(),
+            ),
+            (
+                "let r = Symbol.asyncIterator.toString()",
+                "Symbol(Symbol.asyncIterator)".into(),
+            ),
+            ("let r = Symbol.iterator in [1]", false.into()),
+            (
+                "let r = Symbol.toString()",
+                "function Symbol() { [native code] }".into(),
+            ),
+        ] {
+            assert_eq!(run(src, "r"), expected, "{src}");
+        }
+        let err = run_err("let s = Symbol(); let r = s + 1");
+        assert!(matches!(err, JSError::TypeError(_)), "{err:?}");
+        let err = run_err("console()");
+        assert!(matches!(err, JSError::TypeError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_call_apply_bind() {
+        let add = "function add(a, b) { return a + b }";
+        for (src, expected) in [
+            ("let r = add.call(null, 1, 2)", JsValue::from(3.0)),
+            ("let r = add.call()", f64::NAN.into()),
+            ("let r = add.apply(null, [1, 2])", 3.0.into()),
+            ("let r = add.apply(null)", f64::NAN.into()),
+            ("let inc = add.bind(null, 1); let r = inc(5)", 6.0.into()),
+            ("let r = add.bind(null, 1, 2)()", 3.0.into()),
+            (
+                "let inc = add.bind(null, 1); let r = inc.call(null, 10)",
+                11.0.into(),
+            ),
+            ("let r = add.bind(null, 1).bind(null, 2)()", 3.0.into()),
+            // `bind` makes a new function and leaves the original alone.
+            (
+                "let inc = add.bind(null, 100); let r = add(1, 2)",
+                3.0.into(),
+            ),
+            ("let r = add.bind(null) === add", false.into()),
+            ("let r = add.length", 2.0.into()),
+            ("let r = add.bind(null, 1).length", 1.0.into()),
+            ("let r = typeof add.bind(null)", "function".into()),
+        ] {
+            let src = format!("{add} {src}");
+            assert_eq!(run(&src, "r"), expected, "{src}");
+        }
+        for (src, expected) in [
+            (
+                "function f(a, b = 1, c) { } let r = f.length",
+                JsValue::from(1.0),
+            ),
+            ("function f(a, ...rest) { } let r = f.length", 1.0.into()),
+            (
+                "function f() { return 7 } let fns = [f]; let r = fns[0]()",
+                7.0.into(),
+            ),
+            // A built-in's bound `this` is the object it runs on.
+            (
+                "let a = [1, 2]; let push = a.push.bind(a); push(3); push(4); let r = a.join()",
+                "1,2,3,4".into(),
+            ),
+            ("let a = [3, 1]; let r = a.join.call(a, '-')", "3-1".into()),
+            (
+                "let r = [].concat.apply([1], [[2], [3]]).join()",
+                "1,2,3".into(),
+            ),
+            (
+                "let log = console.log.bind(console); log('(bound console.log)'); let r = 1",
+                1.0.into(),
+            ),
+            // Calls through `call` run on the frame stack, not in Rust.
+            (
+                "function down(n) { if (n == 0) { return 0 } return down.call(null, n - 1) + 1 } let r = down(5000)",
+                5000.0.into(),
+            ),
+        ] {
+            assert_eq!(run(src, "r"), expected, "{src}");
+        }
+        for src in [
+            "let push = [].push; push(1)",
+            "function f() { } f.apply(null, 5)",
+        ] {
+            let err = run_err(src);
+            assert!(matches!(err, JSError::TypeError(_)), "{src}: {err:?}");
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::{
     executor::instr::Operand,
     primitive::{
         func::Func,
+        key::PropertyKey,
         objects::Object,
         proto::{Prototype, RcPrototype},
     },
@@ -20,6 +21,7 @@ use crate::{
 
 pub mod func;
 pub mod jstack;
+pub mod key;
 pub mod non_numeric;
 pub mod numeric;
 pub mod objects;
@@ -197,36 +199,66 @@ impl Object for JsValue {
         PRIMITIVE_PROTO.with(|v| v.clone())
     }
 
-    fn get_props(&self) -> Vec<String> {
-        todo!()
+    fn get_props(&self) -> Vec<PropertyKey> {
+        match self {
+            Self::Object(obj) => obj.get_props(),
+            Self::Function(f) => f.get_props(),
+            _ => vec![],
+        }
     }
 
     fn get_methods(&self) -> Vec<String> {
-        todo!()
-    }
-
-    fn get_prop(&self, prop: &str) -> Result<JsValue, crate::error::JSError> {
-        if let Self::Object(obj) = self {
-            Ok(obj.get_prop(prop)?)
-        } else {
-            todo!()
+        match self {
+            Self::Object(obj) => obj.get_methods(),
+            Self::Function(f) => f.get_methods(),
+            _ => vec![],
         }
     }
 
-    fn set_prop(&self, prop: &str, value: JsValue) -> Result<(), JSError> {
-        if let Self::Object(obj) = self {
-            Ok(obj.set_prop(prop, value)?)
-        } else {
-            todo!()
+    fn get_prop(&self, prop: &PropertyKey) -> Result<JsValue, crate::error::JSError> {
+        match self {
+            Self::Object(obj) => obj.get_prop(prop),
+            Self::Function(f) => f.get_prop(prop),
+            Self::Null | Self::Undefined => Err(JSError::TypeError(format!(
+                "Cannot read properties of {self} (reading '{prop}')"
+            ))),
+            Self::Str(s) if prop == "length" => Ok((s.encode_utf16().count() as f64).into()),
+            Self::Symbol(_) if prop == "description" => Ok(JsValue::Undefined),
+            // `valueOf` and `toString`, or undefined.
+            _ => Ok(self
+                .prototype()
+                .0
+                .borrow()
+                .get(prop)
+                .unwrap_or(JsValue::Undefined)),
         }
     }
 
-    fn has_prop(&self, _prop: &str) -> bool {
-        todo!()
+    /// Setting a property on a primitive does nothing, as in sloppy-mode JS.
+    fn set_prop(&self, prop: &PropertyKey, value: JsValue) -> Result<(), JSError> {
+        match self {
+            Self::Object(obj) => obj.set_prop(prop, value),
+            Self::Null | Self::Undefined => Err(JSError::TypeError(format!(
+                "Cannot set properties of {self} (setting '{prop}')"
+            ))),
+            _ => Ok(()),
+        }
     }
 
-    fn has_method(&self, _method: &str) -> bool {
-        todo!()
+    fn has_prop(&self, prop: &PropertyKey) -> bool {
+        match self {
+            Self::Object(obj) => obj.has_prop(prop),
+            Self::Function(f) => f.get_prop(prop).is_ok(),
+            _ => false,
+        }
+    }
+
+    fn has_method(&self, method: &str) -> bool {
+        match self {
+            Self::Object(obj) => obj.has_method(method),
+            Self::Function(f) => matches!(f.get_prop(&method.into()), Ok(JsValue::Function(_))),
+            _ => false,
+        }
     }
 
     fn call(
@@ -236,19 +268,27 @@ impl Object for JsValue {
         method: &Func,
         args: &[Operand],
     ) -> Result<(), JSError> {
-        if let Self::Object(ob) = self {
-            Ok(ob.call(engine, scope, method, args)?)
-        } else if let Self::Function(f) = self {
-            let args = args
-                .iter()
-                .map(|a| engine.resolve_value(a, scope))
-                .collect::<Result<Vec<_>, _>>()?;
-            let result = engine.call_function(f, args)?;
-            engine.set_register(crate::executor::engine::Register::AX, result);
-            Ok(())
-        } else {
-            todo!()
-        }
+        let result = match self {
+            Self::Object(ob) => return ob.call(engine, scope, method, args),
+            // A method of the function (`f.call`, `f.bind`, ...).
+            Self::Function(f) => return f.call(engine, scope, method, args),
+            Self::Null | Self::Undefined => {
+                return Err(JSError::TypeError(format!(
+                    "Cannot read properties of {self} (reading '{method}')"
+                )));
+            }
+            // The primitives' own methods.
+            _ => match method.as_ref() {
+                "valueOf" => self.clone(),
+                "toString" => match self {
+                    Self::Symbol(id) => PropertyKey::Symbol(*id).to_string().into(),
+                    other => other.to_js_string()?.into(),
+                },
+                name => return Err(JSError::MethodNotFound(name.into())),
+            },
+        };
+        engine.set_register(crate::executor::engine::Register::AX, result);
+        Ok(())
     }
 
     fn value_of(&self) -> Result<JsValue, JSError> {
